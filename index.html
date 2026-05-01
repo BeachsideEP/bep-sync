@@ -533,9 +533,9 @@
       <div class="tab-content" id="tab-referralhub">
         <!-- Top stats -->
         <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px;">
-          <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers (all time)</div></div>
-          <div class="stat-card"><div class="stat-label">Referred Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">from known sources (all time)</div></div>
-          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">all time</div></div>
+          <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers this period</div></div>
+          <div class="stat-card"><div class="stat-label">Referred Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">new patients this period</div></div>
+          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">this period</div></div>
           <div class="stat-card"><div class="stat-label">Est. Revenue</div><div class="stat-value c-success" id="ref-revenue">—</div><div class="stat-sub">from referred patients</div></div>
         </div>
 
@@ -663,13 +663,13 @@ function setRange(type, evt) {
     dateTo = new Date(); dateTo.setHours(23,59,59,999);
   } else if (type === 'month') {
     dateFrom = new Date(now.getFullYear(), now.getMonth(), 1);
-    dateTo = new Date(now.getFullYear(), now.getMonth()+1, 0);
+    dateTo = new Date(); // cap at today, not end of month
     dateTo.setHours(23,59,59,999);
     if (!evt) document.querySelectorAll('.filter-btn')[1].classList.add('active');
   } else if (type === 'quarter') {
     const q = Math.floor(now.getMonth() / 3);
     dateFrom = new Date(now.getFullYear(), q * 3, 1);
-    dateTo = new Date(now.getFullYear(), q * 3 + 3, 0);
+    dateTo = new Date(); // cap at today, not end of quarter
     dateTo.setHours(23,59,59,999);
   } else if (type === 'custom') {
     dateFrom = new Date(document.getElementById('date-from').value + 'T00:00:00');
@@ -731,8 +731,8 @@ async function loadDashboard() {
     });
     window._futureByPatient = futureByPatient;
 
-    // Referral sources — fetch ALL patients ever (not just 90 days) for meaningful hub data
-    const refData = await apiGet('get_new_patients', { from: '2000-01-01', to: toStr });
+    // Referral sources — fetch for selected period only, but also all-time for hub charts
+    const refData = await apiGet('get_new_patients', { from: fromStr, to: toStr });
     const refPatients = (refData.patients || []).map(p => ({
       ...p,
       id: String(p.id),
@@ -1685,19 +1685,15 @@ function buildClasses(appts, invoices) {
     classMap[sessionKey].attendees += (a.attendee_count && a.attendee_count > 0) ? a.attendee_count : 0;
   });
 
-  // Match revenue from invoices — invoices linked to class appointments
+  // Match revenue from invoices — use appointment_id directly
   const classApptIds = new Set(classAppts.map(a => String(a.id)));
   invoices.forEach(inv => {
-    const apptId = String(inv.appointment?.links?.self?.split('/').pop() || inv.appointment_id || '');
+    const apptId = String(inv.appointment_id || '');
     if (!apptId || !classApptIds.has(apptId)) return;
-    // Find which class this invoice belongs to
     const appt = classAppts.find(a => String(a.id) === apptId);
     if (!appt) return;
-    const dt = new Date(appt.starts_at);
-    const timeStr = dt.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', hour12: false });
-    const dayStr = dt.toLocaleDateString('en-AU', { weekday: 'long' });
-    const classKey = `${appt.appointment_type_name || 'Unknown Class'}|${dayStr}|${timeStr}`;
-    if (classMap[classKey]) classMap[classKey].revenue += parseFloat(inv.total_amount || inv.amount || 0);
+    const sessionKey = appt.starts_at.slice(0, 16);
+    if (classMap[sessionKey]) classMap[sessionKey].revenue += parseFloat(inv.total_amount || 0);
   });
 
   const classes = Object.values(classMap).sort((a,b) => b.starts_at.localeCompare(a.starts_at));
