@@ -773,15 +773,10 @@ function processAll(appts, newPatients, invoices, fromStr, toStr, refPatients) {
   console.log(`Cancelled: ${cancelled.length}`);
   console.log(`Attended: ${attended}, DNA: ${dna}, Completed: ${completed}`);
   console.log(`Cancel rate: ${cancelRate}% (${cancelled.length} of ${totalBooked})`);
-  // New patients = registered in period AND had at least one attended appointment
-  const periodPatIds = new Set(pastActive.filter(isAttended).map(a => a._patId).filter(Boolean));
-  const newPatientsFiltered = newPatients.filter(p => {
-    const pid = p.id ? String(p.id) : null;
-    return pid && periodPatIds.has(pid);
-  });
-  // Fall back to all registered if cross-filter gives 0 (ID mismatch edge case)
-  const newPatientsDisplay = newPatientsFiltered.length > 0 ? newPatientsFiltered : newPatients;
-  console.log(`New patients: ${newPatientsDisplay.length} (registered: ${newPatients.length}, cross-filtered: ${newPatientsFiltered.length})`);
+  // New patients = all registered in the selected period
+  // Cross-filtering by appointments was causing ID precision issues with 18-digit Supabase IDs
+  const newPatientsDisplay = newPatients;
+  console.log(`New patients registered in period: ${newPatients.length}`);
   // Sample an active appt to check fields
   if (active[0]) {
     console.log('Sample active appt:', {
@@ -1355,9 +1350,10 @@ function buildTimeLost(appts, fromStr, toStr) {
   const rateSub = document.getElementById('tl-rate-sub');
   if (rateSub) rateSub.textContent = 'at $' + RATE + '/hr';
 
-  // Chart — daily capacity = sum of all contracted weekly hours ÷ 5
-  // hoursStore now uses full names as keys
-  const knownWeeklyTotal = Object.values(hoursStore).reduce((s, h) => s + (parseFloat(h)||0), 0);
+  // Chart — daily capacity only from practitioners who have both hours AND appear in data
+  const knownWeeklyTotal = Object.values(pracData)
+    .filter(p => p.capacity != null)
+    .reduce((s, p) => s + (p.wkHrs || 0), 0);
   const dailyCapacity = knownWeeklyTotal / 5;
   const days = {};
   let d2 = new Date(fromStr + 'T00:00:00');
@@ -1430,7 +1426,7 @@ function buildClasses(appts, invoices) {
       classMap[classKey] = { name: typeName, day: dayStr, time: timeStr, sessions: new Set(), attendees: 0, revenue: 0 };
     }
     classMap[classKey].sessions.add(sessionKey);
-    classMap[classKey].attendees++;
+    classMap[classKey].attendees += (a.attendee_count && a.attendee_count > 0) ? a.attendee_count : 1;
   });
 
   // Match revenue from invoices — invoices linked to class appointments
