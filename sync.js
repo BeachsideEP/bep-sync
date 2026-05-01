@@ -246,11 +246,9 @@ async function syncInvoices() {
   try {
     const items = await clinikoFetchAll('invoices?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'invoices');
     const rows = items.map(function(inv) {
-      // invoice_items may be a linked resource (not inline) — use net_amount or total fields directly
-      const total = parseFloat(inv.net_amount) || parseFloat(inv.total_amount) || 
-        (Array.isArray(inv.invoice_items) ? inv.invoice_items.reduce(function(sum, item) {
-          return sum + (parseFloat(item.total_including_tax) || parseFloat(item.price) || 0);
-        }, 0) : 0);
+      // Cliniko returns invoice_items as a linked resource, not inline
+      // Use the top-level amount fields instead
+      const total = parseFloat(inv.total_amount) || parseFloat(inv.net_amount) || parseFloat(inv.amount_due) || 0;
       const apptLink = (inv.appointment && inv.appointment.links && inv.appointment.links.self) ? inv.appointment.links.self : ((inv.links && inv.links.appointment) ? inv.links.appointment : '');
       const apptId = apptLink ? Number(apptLink.split('/').pop()) : null;
       const patLink = (inv.patient && inv.patient.links && inv.patient.links.self) ? inv.patient.links.self : ((inv.links && inv.links.patient) ? inv.links.patient : '');
