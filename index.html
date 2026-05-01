@@ -533,17 +533,22 @@
       <div class="tab-content" id="tab-referralhub">
         <!-- Top stats -->
         <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px;">
-          <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers (90 days)</div></div>
-          <div class="stat-card"><div class="stat-label">New Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">from referrals (90 days)</div></div>
-          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">this period</div></div>
+          <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers (all time)</div></div>
+          <div class="stat-card"><div class="stat-label">Referred Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">from known sources (all time)</div></div>
+          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">all time</div></div>
           <div class="stat-card"><div class="stat-label">Est. Revenue</div><div class="stat-value c-success" id="ref-revenue">—</div><div class="stat-sub">from referred patients</div></div>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px;">
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:24px;">
+          <!-- Category overview -->
+          <div class="chart-card">
+            <div class="chart-header"><div><div class="chart-title">By Category</div><div class="chart-sub">Cliniko-style grouping</div></div></div>
+            <div style="padding:16px 20px;height:220px;"><canvas id="chart-ref-categories"></canvas></div>
+          </div>
           <!-- Source breakdown -->
           <div class="chart-card">
-            <div class="chart-header"><div><div class="chart-title">Referral Sources</div><div class="chart-sub">Patients by source — last 90 days</div></div></div>
-            <div id="ref-source-list" style="padding:16px 20px;"></div>
+            <div class="chart-header"><div><div class="chart-title">Referral Sources</div><div class="chart-sub">Click to filter — all time</div></div></div>
+            <div id="ref-source-list" style="padding:16px 20px;max-height:250px;overflow-y:auto;"></div>
           </div>
           <!-- Monthly trend -->
           <div class="chart-card">
@@ -726,9 +731,8 @@ async function loadDashboard() {
     });
     window._futureByPatient = futureByPatient;
 
-    // Referral sources — fetch last 90 days regardless of selected period for meaningful data
-    const refFrom = fmtDate(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000));
-    const refData = await apiGet('get_new_patients', { from: refFrom, to: toStr });
+    // Referral sources — fetch ALL patients ever (not just 90 days) for meaningful hub data
+    const refData = await apiGet('get_new_patients', { from: '2000-01-01', to: toStr });
     const refPatients = (refData.patients || []).map(p => ({
       ...p,
       id: String(p.id),
@@ -1042,7 +1046,7 @@ function buildPracTable(appts, newPatients, invoices) {
 function buildReferralList(patients) {
   const sources = {};
   patients.forEach(p => {
-    const s = p.referral_source || p.referred_by || p.patient_referred_by || null;
+    const s = normaliseReferralSource(p.referral_source || p.referred_by || null);
     if (s && s.trim()) { sources[s.trim()] = (sources[s.trim()]||0)+1; }
   });
   const list = document.getElementById('referral-list');
@@ -1063,17 +1067,34 @@ let _refAppts = [];
 let _refInvoices = [];
 let chartRefTrend = null;
 
+// Normalise referral source names — groups common variations
+function normaliseReferralSource(s) {
+  if (!s) return null;
+  const t = s.trim();
+  // Exact aliases
+  const aliases = {
+    'walk': 'Walk In', 'walk in': 'Walk In', 'walkin': 'Walk In',
+    'fortitude': 'Fortitude Health', 'fortitude health': 'Fortitude Health',
+    'interhealth': 'Interhealth Dingley', 'interhealth dingley': 'Interhealth Dingley',
+    'cheltenham mc': 'Cheltenham Medical Centre', 'cheltenham medical centre': 'Cheltenham Medical Centre',
+    'chelsea heights medical centre': 'Chelsea Heights Medical Centre',
+    'chelsea heights mc': 'Chelsea Heights Medical Centre',
+  };
+  const lower = t.toLowerCase();
+  return aliases[lower] || t;
+}
+
 function buildReferralHub(refPatients, appts, invoices) {
   _refPatients = refPatients || [];
   _refAppts    = appts || [];
   _refInvoices = invoices || [];
 
-  // Build sources map
+  // Build sources map with normalised names
   const sources = {};
   _refPatients.forEach(p => {
-    const s = p.referral_source || null;
-    if (!s || !s.trim()) return;
-    const key = s.trim();
+    const raw = p.referral_source || null;
+    if (!raw || !raw.trim()) return;
+    const key = normaliseReferralSource(raw);
     if (!sources[key]) sources[key] = { count: 0, patients: [] };
     sources[key].count++;
     sources[key].patients.push(p);
@@ -1097,8 +1118,41 @@ function buildReferralHub(refPatients, appts, invoices) {
   document.getElementById('ref-top-count').textContent = topSource ? topSource[1].count + ' patients' : '';
   document.getElementById('ref-revenue').textContent = '$' + refRevenue.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2});
 
-  // Source list
-  const max = sorted[0]?.[1].count || 1;
+  // Category grouping (like Cliniko's overview)
+  function categorise(source) {
+    const s = (source || '').toLowerCase();
+    if (s.includes('medical') || s.includes('clinic') || s.includes('health centre') || s.includes('mc') || s.includes('gp') || s.includes('doctor') || s.includes('dr ')) return 'Medical Centre';
+    if (s.includes('allied') || s.includes('physio') || s.includes('chiro') || s.includes('osteo') || s.includes('podiat') || s.includes('dietit')) return 'Allied Health';
+    if (s.includes('google') || s.includes('search') || s.includes('online') || s.includes('internet') || s.includes('website')) return 'Online/Google';
+    if (s.includes('friend') || s.includes('family') || s.includes('word') || s.includes('client') || s.includes('patient') || s === 'pal' || s === 'bushy' || s === 'deanna' || s === 'vardi') return 'Client Referral';
+    if (s.includes('adf') || s.includes('defence') || s.includes('military') || s.includes('veteran') || s.includes('dva')) return 'ADF/DVA';
+    if (s.includes('walk')) return 'Walk In';
+    return 'Other';
+  }
+
+  const categories = {};
+  sorted.forEach(([name, data]) => {
+    const cat = categorise(name);
+    if (!categories[cat]) categories[cat] = 0;
+    categories[cat] += data.count;
+  });
+
+  // Add category pie chart
+  const catCanvas = document.getElementById('chart-ref-categories');
+  let chartRefCat = window._chartRefCat;
+  if (chartRefCat) chartRefCat.destroy();
+  if (catCanvas && Object.keys(categories).length) {
+    const catEntries = Object.entries(categories).sort((a,b)=>b[1]-a[1]);
+    const COLORS = ['rgba(56,189,248,0.8)','rgba(52,211,153,0.8)','rgba(251,191,36,0.8)','rgba(249,115,22,0.8)','rgba(167,139,250,0.8)','rgba(244,114,182,0.8)','rgba(148,163,184,0.5)'];
+    window._chartRefCat = new Chart(catCanvas, {
+      type: 'doughnut',
+      data: {
+        labels: catEntries.map(([k]) => k),
+        datasets: [{ data: catEntries.map(([,v])=>v), backgroundColor: COLORS, borderWidth: 0 }]
+      },
+      options: { responsive:true, maintainAspectRatio:false, plugins:{ legend:{ position:'right', labels:{ color:'#94a3b8', font:{ size:11 }, padding:12 } } } }
+    });
+  }
   document.getElementById('ref-source-list').innerHTML = sorted.slice(0,15).map(([name,data]) => `
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;cursor:pointer;" onclick="filterRefBySource('${name.replace(/'/g,"\\'")}')">
       <div style="font-size:12px;color:var(--text);width:160px;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${name}">${name}</div>
