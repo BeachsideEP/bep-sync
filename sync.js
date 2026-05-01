@@ -6,8 +6,6 @@
  *   cp .env.example .env   (fill in your keys)
  *   node sync.js           (run manually or via cron)
  *
- * Cron (every 4 hours):
- *   0 */4 * * * cd /path/to/sync && node sync.js >> sync.log 2>&1
  */
 
 require('dotenv').config();
