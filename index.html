@@ -847,9 +847,9 @@ function processAll(appts, newPatients, invoices, fromStr, toStr) {
   // Build charts and tables
   buildApptsChart(active, fromStr, toStr);
   buildDnaChart(attended, dna);
-  buildReferralList(newPatients);
+  buildReferralList(newPatients); // use all registered patients for referral sources
   buildDnaList(active);
-  buildPracTable(active, newPatients, invoices);
+  buildPracTable(active, newPatientsDisplay, invoices);
   buildCancelTable(cancelled, appts);
   buildRevenueChart(invoices, fromStr, toStr);
   buildRevenueTable(invoices, active);
@@ -1227,29 +1227,43 @@ function renderPracHoursEditor() {
   const store = getPracHoursStore();
   const grid = document.getElementById('prac-hours-grid');
   if (!grid) return;
-  // Show all stored practitioners — merge defaults + any extras
-  const allKeys = new Set([...Object.keys(PRAC_HOURS_DEFAULTS), ...Object.keys(store)]);
-  grid.innerHTML = [...allKeys].map(key => `
+
+  // Get practitioners from live appointment data + defaults
+  const fromAppts = new Set(
+    (allAppointments || [])
+      .map(a => a.practitioner_name)
+      .filter(n => n && n !== '(no practitioner)')
+  );
+  // Merge with stored keys (in case no data loaded yet)
+  const storedKeys = new Set(Object.keys(store));
+  // Build display list: prefer full names from appointments
+  const displayNames = [...fromAppts].length > 0 ? [...fromAppts].sort() : [...storedKeys].sort();
+
+  grid.innerHTML = displayNames.map(name => {
+    const key = name.trim().toLowerCase().split(' ')[0];
+    const val = store[name] ?? store[key] ?? '';
+    return `
     <div style="background:var(--surface2);border:1px solid var(--border);border-radius:9px;padding:12px 14px;">
-      <div style="font-size:12px;color:var(--muted);margin-bottom:6px;text-transform:capitalize;">${key}</div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px;">${name}</div>
       <div style="display:flex;align-items:center;gap:6px;">
-        <input type="number" id="prac-hrs-${key}" min="0" max="60" step="0.5" value="${store[key] ?? ''}"
+        <input type="number" id="prac-hrs-${encodeURIComponent(name)}" data-name="${name}" min="0" max="60" step="0.5" value="${val}"
           style="width:60px;background:var(--bg);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;color:var(--white);font-family:'DM Mono',monospace;font-size:14px;text-align:center;">
         <span style="font-size:12px;color:var(--muted);">hrs/wk</span>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('') || '<div style="color:var(--muted);font-size:13px;padding:8px;">Load data first to see practitioners.</div>';
 
   const rateInput = document.getElementById('tl-rate-input');
   if (rateInput) rateInput.value = getRateStore();
 }
 
 function savePracHours() {
-  const store = getPracHoursStore();
-  const allKeys = new Set([...Object.keys(PRAC_HOURS_DEFAULTS), ...Object.keys(store)]);
   const newStore = {};
-  allKeys.forEach(key => {
-    const el = document.getElementById('prac-hrs-' + key);
-    if (el) { const v = parseFloat(el.value); if (!isNaN(v) && v >= 0) newStore[key] = v; }
+  // Read all inputs by data-name attribute (full practitioner names)
+  document.querySelectorAll('#prac-hours-grid input[data-name]').forEach(el => {
+    const name = el.getAttribute('data-name');
+    const v = parseFloat(el.value);
+    if (name && !isNaN(v) && v >= 0) newStore[name] = v;
   });
   localStorage.setItem('bep_prac_hours', JSON.stringify(newStore));
   const rateEl = document.getElementById('tl-rate-input');
@@ -1278,12 +1292,13 @@ function buildTimeLost(appts, fromStr, toStr) {
   while (d <= end) { if (d.getDay() !== 0 && d.getDay() !== 6) workDays++; d.setDate(d.getDate()+1); }
 
   // Identify practitioners from data (ignore null/unmatched)
-  const pracSet = new Set(appts.map(a => a.practitioner_name).filter(n => n && n !== '(no practitioner)'));
+  const pracSet = new Set(appts.filter(a => !isGroup(a)).map(a => a.practitioner_name).filter(n => n && n !== '(no practitioner)'));
   // Per-practitioner capacity: weeklyHours ÷ 5 days × workDays
   const pracData = {};
   pracSet.forEach(name => {
+    // Look up by full name first, fall back to first name key for legacy data
     const key = name.trim().toLowerCase().split(' ')[0];
-    const wkHrs = hoursStore[key] ?? null;
+    const wkHrs = hoursStore[name] ?? hoursStore[key] ?? null;
     const capacity = wkHrs != null ? Math.round((wkHrs / 5) * workDays) : null;
     pracData[name] = { attended: 0, dna: 0, cancelled: 0, capacity, wkHrs };
   });
