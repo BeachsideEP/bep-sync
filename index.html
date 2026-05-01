@@ -244,6 +244,10 @@
         <svg viewBox="0 0 24 24"><path d="M18 20V10"/><path d="M12 20V4"/><path d="M6 20v-6"/></svg>
         Classes
       </div>
+      <div class="nav-item" onclick="switchTab('referralhub', this)">
+        <svg viewBox="0 0 24 24"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        Referral Hub
+      </div>
     </div>
     <div class="sidebar-footer">
       <div style="font-size:11px; color:var(--muted); margin-bottom:10px;" id="last-updated">Not yet loaded</div>
@@ -525,6 +529,56 @@
         </div>
       </div>
 
+      <!-- ── REFERRAL HUB TAB ─────────────────────────────── -->
+      <div class="tab-content" id="tab-referralhub" style="display:none;">
+        <!-- Top stats -->
+        <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px;">
+          <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers (90 days)</div></div>
+          <div class="stat-card"><div class="stat-label">New Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">from referrals (90 days)</div></div>
+          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">this period</div></div>
+          <div class="stat-card"><div class="stat-label">Est. Revenue</div><div class="stat-value c-success" id="ref-revenue">—</div><div class="stat-sub">from referred patients</div></div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-bottom:24px;">
+          <!-- Source breakdown -->
+          <div class="chart-card">
+            <div class="chart-header"><div><div class="chart-title">Referral Sources</div><div class="chart-sub">Patients by source — last 90 days</div></div></div>
+            <div id="ref-source-list" style="padding:16px 20px;"></div>
+          </div>
+          <!-- Monthly trend -->
+          <div class="chart-card">
+            <div class="chart-header"><div><div class="chart-title">Referral Trend</div><div class="chart-sub">New patients by month</div></div></div>
+            <div style="padding:16px 20px;height:220px;"><canvas id="chart-ref-trend"></canvas></div>
+          </div>
+        </div>
+
+        <!-- Detailed patient list -->
+        <div class="table-card">
+          <div class="table-header">
+            <div class="table-title">Referred Patients</div>
+            <div style="display:flex;gap:8px;align-items:center;">
+              <input id="ref-search" type="text" placeholder="Search patient or source..." oninput="filterRefTable()" style="background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:6px 12px;font-size:12px;color:var(--white);font-family:'DM Sans',sans-serif;width:220px;outline:none;">
+              <select id="ref-filter-source" onchange="filterRefTable()" style="background:var(--surface2);border:1px solid var(--border2);border-radius:8px;padding:6px 10px;font-size:12px;color:var(--white);font-family:'DM Sans',sans-serif;outline:none;">
+                <option value="">All Sources</option>
+              </select>
+            </div>
+          </div>
+          <div style="overflow-x:auto;">
+            <table class="data-table">
+              <thead><tr>
+                <th>Patient</th>
+                <th>Referral Source</th>
+                <th>Registered</th>
+                <th>Appointments</th>
+                <th>Revenue</th>
+                <th>Practitioner</th>
+              </tr></thead>
+              <tbody id="ref-patient-body"><tr><td colspan="6" class="empty">Load data to view</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
     </div>
   </main>
 </div>
@@ -539,7 +593,7 @@ let chartAppts = null, chartDna = null, chartPrac = null, chartRevenue = null;
 let allAppointments = [], allNewPatients = [], allInvoices = [];
 
 // ── TAB SWITCHING ──────────────────────────────────
-const TAB_TITLES = { overview: 'Overview', practitioners: 'Practitioners', cancellations: 'Cancellations', revenue: 'Revenue', actions: 'Action Centre', timelost: 'Time Lost', team: 'Team', classes: 'Classes' };
+const TAB_TITLES = { overview: 'Overview', practitioners: 'Practitioners', cancellations: 'Cancellations', revenue: 'Revenue', actions: 'Action Centre', timelost: 'Time Lost', team: 'Team', classes: 'Classes', referralhub: 'Referral Hub' };
 function switchTab(name, el) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
@@ -850,7 +904,8 @@ function processAll(appts, newPatients, invoices, fromStr, toStr, refPatients) {
   // Build charts and tables
   buildApptsChart(active, fromStr, toStr);
   buildDnaChart(attended, dna);
-  buildReferralList(refPatients || newPatients); // 90-day window for referral sources
+  buildReferralList(refPatients || newPatients); // overview referral section
+  buildReferralHub(refPatients || newPatients, appts, invoices); // full referral hub tab
   buildDnaList(active);
   buildPracTable(appts, newPatientsDisplay, invoices);
   buildCancelTable(cancelled, appts);
@@ -1002,6 +1057,147 @@ function buildReferralList(patients) {
     </div>`).join('');
 }
 
+// ── REFERRAL HUB ──────────────────────────────────
+let _refPatients = [];
+let _refAppts = [];
+let _refInvoices = [];
+let chartRefTrend = null;
+
+function buildReferralHub(refPatients, appts, invoices) {
+  _refPatients = refPatients || [];
+  _refAppts    = appts || [];
+  _refInvoices = invoices || [];
+
+  // Build sources map
+  const sources = {};
+  _refPatients.forEach(p => {
+    const s = p.referral_source || null;
+    if (!s || !s.trim()) return;
+    const key = s.trim();
+    if (!sources[key]) sources[key] = { count: 0, patients: [] };
+    sources[key].count++;
+    sources[key].patients.push(p);
+  });
+
+  const sorted = Object.entries(sources).sort((a,b) => b[1].count - a[1].count);
+  const totalPatients = _refPatients.filter(p => p.referral_source).length;
+  const totalSources = sorted.length;
+  const topSource = sorted[0];
+
+  // Revenue from referred patients
+  const refPatientIds = new Set(_refPatients.filter(p=>p.referral_source).map(p=>String(p.id)));
+  const refRevenue = _refInvoices.reduce((s,inv) => {
+    return s + (refPatientIds.has(String(inv.patient_id)) ? parseFloat(inv.total_amount||0) : 0);
+  }, 0);
+
+  // Update stats
+  document.getElementById('ref-total-sources').textContent = totalSources;
+  document.getElementById('ref-total-patients').textContent = totalPatients;
+  document.getElementById('ref-top-name').textContent = topSource ? topSource[0] : '—';
+  document.getElementById('ref-top-count').textContent = topSource ? topSource[1].count + ' patients' : '';
+  document.getElementById('ref-revenue').textContent = '$' + refRevenue.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+  // Source list
+  const max = sorted[0]?.[1].count || 1;
+  document.getElementById('ref-source-list').innerHTML = sorted.slice(0,15).map(([name,data]) => `
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;cursor:pointer;" onclick="filterRefBySource('${name.replace(/'/g,"\\'")}')">
+      <div style="font-size:12px;color:var(--text);width:160px;flex-shrink:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${name}">${name}</div>
+      <div style="flex:1;height:6px;background:var(--border2);border-radius:3px;">
+        <div style="width:${Math.round(data.count/max*100)}%;height:100%;background:var(--sky);border-radius:3px;"></div>
+      </div>
+      <div style="font-size:12px;font-family:'DM Mono',monospace;color:var(--sky);width:24px;text-align:right;">${data.count}</div>
+    </div>`).join('');
+
+  // Source filter dropdown
+  const sel = document.getElementById('ref-filter-source');
+  sel.innerHTML = '<option value="">All Sources</option>' +
+    sorted.map(([name]) => `<option value="${name}">${name}</option>`).join('');
+
+  // Monthly trend chart
+  const monthMap = {};
+  _refPatients.filter(p=>p.referral_source && p.created_at).forEach(p => {
+    const m = p.created_at.slice(0,7);
+    monthMap[m] = (monthMap[m]||0) + 1;
+  });
+  const months = Object.keys(monthMap).sort().slice(-12);
+  const monthLabels = months.map(m => { const [y,mo] = m.split('-'); return new Date(y,mo-1).toLocaleDateString('en-AU',{month:'short',year:'2-digit'}); });
+  if (chartRefTrend) chartRefTrend.destroy();
+  const ctx = document.getElementById('chart-ref-trend');
+  if (ctx && months.length) {
+    chartRefTrend = new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: monthLabels,
+        datasets: [{ data: months.map(m=>monthMap[m]||0), backgroundColor: 'rgba(56,189,248,0.7)', borderRadius: 4 }]
+      },
+      options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, scales:{x:{ticks:{color:'#64748b',font:{size:10}}},y:{ticks:{color:'#64748b',stepSize:1},grid:{color:'rgba(255,255,255,0.05)'}}} }
+    });
+  }
+
+  renderRefTable(_refPatients, _refAppts, _refInvoices);
+}
+
+function filterRefBySource(source) {
+  document.getElementById('ref-filter-source').value = source;
+  filterRefTable();
+}
+
+function filterRefTable() {
+  const search = (document.getElementById('ref-search').value || '').toLowerCase();
+  const source = document.getElementById('ref-filter-source').value;
+  const filtered = _refPatients.filter(p => {
+    if (source && p.referral_source !== source) return false;
+    if (search) {
+      const name = [p.first_name, p.last_name].filter(Boolean).join(' ').toLowerCase();
+      const src  = (p.referral_source||'').toLowerCase();
+      if (!name.includes(search) && !src.includes(search)) return false;
+    }
+    return true;
+  });
+  renderRefTable(filtered, _refAppts, _refInvoices);
+}
+
+function renderRefTable(patients, appts, invoices) {
+  const tbody = document.getElementById('ref-patient-body');
+  if (!patients.length) { tbody.innerHTML = '<tr><td colspan="6" class="empty">No patients found</td></tr>'; return; }
+
+  // Count appts and revenue per patient
+  const apptsByPat = {};
+  appts.filter(a => !isCancelled(a)).forEach(a => {
+    const pid = String(a.patient_id || a._patId || '');
+    if (!pid) return;
+    if (!apptsByPat[pid]) apptsByPat[pid] = { count: 0, prac: null };
+    apptsByPat[pid].count++;
+    if (!apptsByPat[pid].prac && a.practitioner_name) apptsByPat[pid].prac = a.practitioner_name;
+  });
+  const revByPat = {};
+  invoices.forEach(inv => {
+    const pid = String(inv.patient_id || '');
+    if (!pid) return;
+    revByPat[pid] = (revByPat[pid]||0) + parseFloat(inv.total_amount||0);
+  });
+
+  tbody.innerHTML = patients
+    .filter(p => p.referral_source)
+    .sort((a,b) => (b.created_at||'').localeCompare(a.created_at||''))
+    .slice(0, 100)
+    .map(p => {
+      const pid = String(p.id);
+      const name = [p.first_name, p.last_name].filter(Boolean).join(' ') || 'Unknown';
+      const reg = p.created_at ? new Date(p.created_at).toLocaleDateString('en-AU',{day:'numeric',month:'short',year:'numeric'}) : '—';
+      const apptData = apptsByPat[pid] || { count: 0, prac: null };
+      const rev = revByPat[pid] || 0;
+      return `<tr>
+        <td class="fw">${name}</td>
+        <td style="font-size:12px;"><span style="background:rgba(56,189,248,0.1);color:var(--sky);padding:3px 8px;border-radius:12px;font-size:11px;">${p.referral_source}</span></td>
+        <td style="font-size:12px;color:var(--muted2);">${reg}</td>
+        <td class="mono">${apptData.count}</td>
+        <td class="mono c-success">${rev > 0 ? '$'+rev.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2}) : '—'}</td>
+        <td style="font-size:12px;color:var(--muted2);">${apptData.prac||'—'}</td>
+      </tr>`;
+    }).join('');
+}
+
 function buildDnaList(appts) {
   const dnas = appts.filter(isDNA).sort((a,b)=>new Date(b.starts_at)-new Date(a.starts_at)).slice(0,15);
   const list = document.getElementById('dna-list');
@@ -1069,11 +1265,14 @@ function buildCancelTable(cancelled, allAppts) {
   });
 
   const sorted = [...cancelled].sort((a,b) => new Date(b.cancelled_at) - new Date(a.cancelled_at));
+  const followUps = JSON.parse(localStorage.getItem('bep_followups') || '{}');
 
   tbody.innerHTML = sorted.map(a => {
     const id = a.id;
     const patId = a._patId;
     const fu = getFollowUp(id);
+    // Hide if marked done
+    if (fu.followed) return '';
     const cancelDate = new Date(a.cancelled_at).toLocaleDateString('en-AU',{day:'numeric',month:'short'});
     const apptDate = new Date(a.starts_at).toLocaleDateString('en-AU',{weekday:'short',day:'numeric',month:'short'});
     const nextAppt = patId ? nextApptByPatient[patId] : null;
