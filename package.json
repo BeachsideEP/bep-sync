@@ -1,0 +1,11 @@
+{
+  "name": "bep-dashboard-sync",
+  "version": "2.0.0",
+  "main": "sync.js",
+  "dependencies": {
+    "dotenv": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
