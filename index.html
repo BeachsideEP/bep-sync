@@ -855,6 +855,7 @@ function processAll(appts, newPatients, invoices, fromStr, toStr) {
   buildRevenueTable(invoices, active);
   buildTimeLost(appts, fromStr, toStr);
   generateDNAActions(appts.filter(isDNA));
+  generateCancelActions(cancelled);
   buildClasses(appts, invoices);
 
   // Show cancellation debug in Classes tab banner so it's visible without console
@@ -1195,9 +1196,29 @@ function generateDNAActions(dnAppts) {
     if (!actions.find(x => x.id === key)) {
       const dt = new Date(a.starts_at);
       const dateStr = dt.toLocaleDateString('en-AU',{day:'numeric',month:'short'});
-      actions.push({ id: key, text: `Call ${a.patient_name||'patient'} re DNA on ${dateStr}`, tag: 'Cancellation', priority: 'high', done: false, createdAt: new Date().toLocaleDateString('en-AU') });
+      actions.push({ id: key, text: `Call ${a.patient_name||'patient'} re DNA on ${dateStr}`, tag: 'DNA', priority: 'high', done: false, createdAt: new Date().toLocaleDateString('en-AU') });
     }
   });
+  saveActions(actions);
+  renderActions();
+}
+
+function generateCancelActions(cancelledAppts) {
+  const actions = getActions();
+  // Only recent cancellations (last 14 days)
+  const cutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString();
+  cancelledAppts
+    .filter(a => a.cancelled_at && a.cancelled_at >= cutoff)
+    .slice(0, 10)
+    .forEach(a => {
+      const key = 'cancel_' + a.id;
+      if (!actions.find(x => x.id === key)) {
+        const dt = new Date(a.starts_at);
+        const dateStr = dt.toLocaleDateString('en-AU',{day:'numeric',month:'short'});
+        const note = a.cancellation_note ? ` (${a.cancellation_note.slice(0,40)})` : '';
+        actions.push({ id: key, text: `Rebook ${a.patient_name||'patient'} — cancelled ${dateStr}${note}`, tag: 'Cancellation', priority: 'normal', done: false, createdAt: new Date().toLocaleDateString('en-AU') });
+      }
+    });
   saveActions(actions);
   renderActions();
 }
