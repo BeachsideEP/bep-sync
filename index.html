@@ -1201,6 +1201,13 @@ async function buildGrowthTab() {
     }
   }
 
+  // Fetch practitioners lookup once
+  let pracLookupGrowth = {};
+  try {
+    const pracRes = await apiGet('get_practitioners');
+    pracLookupGrowth = pracRes.practitioners || {};
+  } catch(e) {}
+
   // Fetch data for all periods in parallel (batch via worker)
   const periodData = await Promise.all(periods.map(async p => {
     try {
@@ -1220,16 +1227,17 @@ async function buildGrowthTab() {
       const attendRate = booked > 0 ? Math.round(attended.length / booked * 100) : 0;
       const cancelRate = (booked + cancelled.length) > 0 ? Math.round(cancelled.length / (booked + cancelled.length) * 100) : 0;
       const classAttendees = classes.reduce((s, a) => s + (a.attendee_count || 0), 0);
-      const revenue = (invRes.invoices || []).reduce((s, inv) => s + parseFloat(inv.total_amount || 0), 0);
+      const invoices = (invRes.invoices || []);
+      const revenue = invoices.reduce((s, inv) => s + parseFloat(inv.total_amount || 0), 0);
       const newClients = (patRes.patients || []).length;
 
-      // Per-practitioner revenue and appts
+      // Enrich invoices with practitioner name using lookup
       const pracRev = {}, pracAppts = {};
-      (invRes.invoices || []).forEach(inv => {
-        const name = inv.practitioner_name || 'Other';
+      invoices.forEach(inv => {
+        const name = inv.practitioner_id ? (pracLookupGrowth[inv.practitioner_id] || 'Other') : 'Other';
         pracRev[name] = (pracRev[name] || 0) + parseFloat(inv.total_amount || 0);
       });
-      indiv.filter(a => !isCancelled(a) && isAttended(a)).forEach(a => {
+      attended.forEach(a => {
         const name = a.practitioner_name || 'Other';
         pracAppts[name] = (pracAppts[name] || 0) + 1;
       });
