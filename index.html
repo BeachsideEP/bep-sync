@@ -672,8 +672,16 @@ async function loadDashboard() {
     });
     window._futureByPatient = futureByPatient;
 
-    // New patients — already date-filtered by Supabase, no cross-filter needed
-    showLoading('Fetching new patients...');
+    // Referral sources — fetch last 90 days regardless of selected period for meaningful data
+    const refFrom = fmtDate(new Date(Date.now() - 90 * 24 * 60 * 60 * 1000));
+    const refData = await apiGet('get_new_patients', { from: refFrom, to: toStr });
+    const refPatients = (refData.patients || []).map(p => ({
+      ...p,
+      id: String(p.id),
+      referral_source: p.referral_source || null,
+    }));
+
+    // New patients for the selected period (for stat card)
     const patientData = await apiGet('get_new_patients', { from: fromStr, to: toStr });
     allNewPatients = (patientData.patients || []).map(p => ({
       ...p,
@@ -693,7 +701,7 @@ async function loadDashboard() {
     }));
 
     showLoading('Building dashboard...');
-    processAll(allAppointments, allNewPatients, allInvoices, fromStr, toStr);
+    processAll(allAppointments, allNewPatients, allInvoices, fromStr, toStr, refPatients);
 
     // Show last sync time from Supabase
     try {
@@ -736,7 +744,7 @@ function isDNA(a)       { return a.is_dna === true || (a.did_not_arrive === true
 function isCancelled(a) { return a.is_cancelled === true || !!a.cancelled_at; }
 
 // ── PROCESS ALL DATA ──────────────────────────────
-function processAll(appts, newPatients, invoices, fromStr, toStr) {
+function processAll(appts, newPatients, invoices, fromStr, toStr, refPatients) {
   const nowISO = new Date().toISOString();
 
   // Separate classes from individual appointments
@@ -847,9 +855,9 @@ function processAll(appts, newPatients, invoices, fromStr, toStr) {
   // Build charts and tables
   buildApptsChart(active, fromStr, toStr);
   buildDnaChart(attended, dna);
-  buildReferralList(newPatients); // use all registered patients for referral sources
+  buildReferralList(refPatients || newPatients); // 90-day window for referral sources
   buildDnaList(active);
-  buildPracTable(active, newPatientsDisplay, invoices);
+  buildPracTable(appts, newPatientsDisplay, invoices);
   buildCancelTable(cancelled, appts);
   buildRevenueChart(invoices, fromStr, toStr);
   buildRevenueTable(invoices, active);
@@ -924,8 +932,9 @@ function buildRevenueChart(invoices, fromStr, toStr) {
 // ── TABLES ────────────────────────────────────────
 function buildPracTable(appts, newPatients, invoices) {
   const pracs = {};
-  // Include ALL appointments (active + cancelled) for full picture
-  appts.forEach(a => {
+  // Exclude group/class appointments from individual practitioner stats
+  const indiv = appts.filter(a => !isGroup(a));
+  indiv.forEach(a => {
     const name = a.practitioner_name || '(no practitioner)';
     if (!pracs[name]) pracs[name] = {total:0, attended:0, dna:0, cancelled:0, noted:0, newPts:0};
     if (isCancelled(a)) { pracs[name].cancelled++; return; }
@@ -1324,7 +1333,7 @@ function buildTimeLost(appts, fromStr, toStr) {
     pracData[name] = { attended: 0, dna: 0, cancelled: 0, capacity, wkHrs };
   });
 
-  appts.forEach(a => {
+  appts.filter(a => !isGroup(a)).forEach(a => {
     const name = a.practitioner_name;
     if (!name || !pracData[name]) return;
     if (isAttended(a)) pracData[name].attended++;
@@ -1346,8 +1355,9 @@ function buildTimeLost(appts, fromStr, toStr) {
   const rateSub = document.getElementById('tl-rate-sub');
   if (rateSub) rateSub.textContent = 'at $' + RATE + '/hr';
 
-  // Chart — daily capacity = sum of contracted weekly hours ÷ 5
-  const knownWeeklyTotal = Object.values(hoursStore).reduce((s, h) => s + h, 0);
+  // Chart — daily capacity = sum of all contracted weekly hours ÷ 5
+  // hoursStore now uses full names as keys
+  const knownWeeklyTotal = Object.values(hoursStore).reduce((s, h) => s + (parseFloat(h)||0), 0);
   const dailyCapacity = knownWeeklyTotal / 5;
   const days = {};
   let d2 = new Date(fromStr + 'T00:00:00');
@@ -1357,9 +1367,10 @@ function buildTimeLost(appts, fromStr, toStr) {
     days[key] = { capacity: isWeekend ? 0 : dailyCapacity, attended: 0 };
     d2.setDate(d2.getDate()+1);
   }
-  appts.filter(isAttended).forEach(a => {
+  // Count attended individual appointments per day
+  appts.filter(a => !isGroup(a) && isAttended(a)).forEach(a => {
     const day = a.starts_at?.slice(0,10);
-    if (days[day] && a.practitioner_name && pracData[a.practitioner_name] !== undefined) days[day].attended++;
+    if (days[day]) days[day].attended++;
   });
 
   const labels = Object.keys(days).map(k => new Date(k+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}));
