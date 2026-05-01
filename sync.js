@@ -204,7 +204,9 @@ async function syncAppointments() {
       const pracLink = (a.practitioner && a.practitioner.links && a.practitioner.links.self) ? a.practitioner.links.self : ((a.links && a.links.practitioner) ? a.links.practitioner : '');
       const pracId = pracLink ? Number(pracLink.split('/').pop()) : null;
       const patLink = (a.patient && a.patient.links && a.patient.links.self) ? a.patient.links.self : ((a.links && a.links.patient) ? a.links.patient : '');
-      const patId = patLink ? Number(patLink.split('/').pop()) : (a.patient && a.patient.id ? Number(a.patient.id) : null);
+      // Use string-based ID extraction to avoid JS large integer precision loss
+      const patIdStr = patLink ? patLink.split('/').pop() : (a.patient && a.patient.id ? String(a.patient.id) : null);
+      const patId = patIdStr ? Number(patIdStr) : null;
       const status = deriveStatus(a);
       return {
         id: Number(a.id),
@@ -244,9 +246,11 @@ async function syncInvoices() {
   try {
     const items = await clinikoFetchAll('invoices?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'invoices');
     const rows = items.map(function(inv) {
-      const total = (inv.invoice_items || []).reduce(function(sum, item) {
-        return sum + (parseFloat(item.total_including_tax) || parseFloat(item.price) || 0);
-      }, 0);
+      // invoice_items may be a linked resource (not inline) — use net_amount or total fields directly
+      const total = parseFloat(inv.net_amount) || parseFloat(inv.total_amount) || 
+        (Array.isArray(inv.invoice_items) ? inv.invoice_items.reduce(function(sum, item) {
+          return sum + (parseFloat(item.total_including_tax) || parseFloat(item.price) || 0);
+        }, 0) : 0);
       const apptLink = (inv.appointment && inv.appointment.links && inv.appointment.links.self) ? inv.appointment.links.self : ((inv.links && inv.links.appointment) ? inv.links.appointment : '');
       const apptId = apptLink ? Number(apptLink.split('/').pop()) : null;
       const patLink = (inv.patient && inv.patient.links && inv.patient.links.self) ? inv.patient.links.self : ((inv.links && inv.links.patient) ? inv.links.patient : '');
