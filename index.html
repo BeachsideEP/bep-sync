@@ -523,8 +523,8 @@
         <div class="table-card">
           <div class="table-header"><div class="table-title">Class Breakdown</div></div>
           <table>
-            <thead><tr><th>Class Name</th><th>Day & Time</th><th>Sessions</th><th>Total Attendees</th><th>Avg / Session</th><th>Est. Revenue</th></tr></thead>
-            <tbody id="cls-table-body"><tr><td colspan="6" class="empty">Load data to view</td></tr></tbody>
+            <thead><tr><th>Class Name</th><th>Date</th><th>Time</th><th>Attendees</th><th>Est. Revenue</th></tr></thead>
+            <tbody id="cls-table-body"><tr><td colspan="5" class="empty">Load data to view</td></tr></tbody>
           </table>
         </div>
       </div>
@@ -1115,7 +1115,7 @@ function buildReferralHub(refPatients, appts, invoices) {
   document.getElementById('ref-total-sources').textContent = totalSources;
   document.getElementById('ref-total-patients').textContent = totalPatients;
   document.getElementById('ref-top-name').textContent = topSource ? topSource[0] : '—';
-  document.getElementById('ref-top-count').textContent = topSource ? topSource[1].count + ' patients' : '';
+  document.getElementById('ref-top-count').textContent = topSource ? topSource[1].count + ' patients total' : '';
   document.getElementById('ref-revenue').textContent = '$' + refRevenue.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2});
 
   // Category grouping (like Cliniko's overview)
@@ -1591,17 +1591,19 @@ function buildTimeLost(appts, fromStr, toStr) {
     else if (isCancelled(a)) pracData[name].cancelled++;
   });
 
-  // Totals — only include practitioners with known capacity
-  let totalCapacity = 0, totalAttended = 0;
+  // Totals — sum only the LOST slots per practitioner (over-utilised = 0 lost, not negative)
+  let totalOpenSlots = 0, totalRevLost = 0;
   Object.values(pracData).forEach(p => {
-    if (p.capacity != null) { totalCapacity += p.capacity; totalAttended += p.attended; }
+    if (p.capacity != null) {
+      const lost = Math.max(0, p.capacity - p.attended);
+      totalOpenSlots += lost;
+      totalRevLost += lost * RATE;
+    }
   });
-  const openSlots = Math.max(0, totalCapacity - totalAttended);
-  const revLost = openSlots * RATE;
 
-  document.getElementById('tl-slots').textContent = openSlots;
-  document.getElementById('tl-hours').textContent = openSlots + 'h';
-  document.getElementById('tl-rev').textContent = '$' + revLost.toLocaleString();
+  document.getElementById('tl-slots').textContent = totalOpenSlots;
+  document.getElementById('tl-hours').textContent = totalOpenSlots + 'h';
+  document.getElementById('tl-rev').textContent = '$' + totalRevLost.toLocaleString();
   const rateSub = document.getElementById('tl-rate-sub');
   if (rateSub) rateSub.textContent = 'at $' + RATE + '/hr';
 
@@ -1667,21 +1669,20 @@ function buildClasses(appts, invoices) {
   // Group appointments: a "class" appointment has max_attendees > 1
   const classAppts = appts.filter(a => !isCancelled(a) && isGroup(a) && a.starts_at <= new Date().toISOString());
 
-  // Group by appointment_type_name + day-of-week + time slot
-  const classMap = {}; // key: "Class Name|HH:MM"
+  // Group by individual session (each class date is its own row)
+  const classMap = {}; // key: exact datetime
   classAppts.forEach(a => {
     const typeName = a.appointment_type_name || 'Unknown Class';
     const dt = new Date(a.starts_at);
+    const dateStr = dt.toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' });
     const timeStr = dt.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', hour12: false });
-    const dayStr = dt.toLocaleDateString('en-AU', { weekday: 'long' });
-    const sessionKey = a.starts_at.slice(0, 16); // unique session = exact datetime
-    const classKey = `${typeName}|${dayStr}|${timeStr}`;
+    const sessionKey = a.starts_at.slice(0, 16);
 
-    if (!classMap[classKey]) {
-      classMap[classKey] = { name: typeName, day: dayStr, time: timeStr, sessions: new Set(), attendees: 0, revenue: 0 };
+    if (!classMap[sessionKey]) {
+      classMap[sessionKey] = { name: typeName, date: dateStr, time: timeStr, starts_at: a.starts_at, attendees: 0, revenue: 0 };
     }
-    classMap[classKey].sessions.add(sessionKey);
-    classMap[classKey].attendees += (a.attendee_count && a.attendee_count > 0) ? a.attendee_count : 1;
+    // Each group_appointment row = one session; use attendee_count directly
+    classMap[sessionKey].attendees += (a.attendee_count && a.attendee_count > 0) ? a.attendee_count : 0;
   });
 
   // Match revenue from invoices — invoices linked to class appointments
@@ -1699,8 +1700,8 @@ function buildClasses(appts, invoices) {
     if (classMap[classKey]) classMap[classKey].revenue += parseFloat(inv.total_amount || inv.amount || 0);
   });
 
-  const classes = Object.values(classMap).map(c => ({ ...c, sessions: c.sessions.size, avg: c.sessions.size > 0 ? (c.attendees / c.sessions.size).toFixed(1) : 0 }));
-  const totalClasses = classes.reduce((s, c) => s + c.sessions, 0);
+  const classes = Object.values(classMap).sort((a,b) => b.starts_at.localeCompare(a.starts_at));
+  const totalClasses = classes.length;
   const totalAttendees = classes.reduce((s, c) => s + c.attendees, 0);
   const totalRevenue = classes.reduce((s, c) => s + c.revenue, 0);
 
@@ -1708,21 +1709,17 @@ function buildClasses(appts, invoices) {
   document.getElementById('cls-attendees').textContent = totalAttendees;
   document.getElementById('cls-revenue').textContent = '$' + totalRevenue.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-  // Table
   const tbody = document.getElementById('cls-table-body');
   if (!classes.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">No classes found in this period</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No classes found in this period</td></tr>';
   } else {
-    tbody.innerHTML = classes
-      .sort((a, b) => b.attendees - a.attendees)
-      .map(c => `<tr>
-        <td class="fw">${c.name}</td>
-        <td style="font-size:12px;color:var(--muted2);">${c.day} ${c.time}</td>
-        <td class="mono">${c.sessions}</td>
-        <td class="mono c-sky">${c.attendees}</td>
-        <td class="mono">${c.avg}</td>
-        <td class="mono c-success">${c.revenue > 0 ? '$' + c.revenue.toLocaleString('en-AU', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—'}</td>
-      </tr>`).join('');
+    tbody.innerHTML = classes.map(c => `<tr>
+      <td class="fw">${c.name}</td>
+      <td style="font-size:12px;color:var(--muted2);">${c.date}</td>
+      <td style="font-size:12px;color:var(--muted2);">${c.time}</td>
+      <td class="mono c-sky">${c.attendees}</td>
+      <td class="mono c-success">${c.revenue > 0 ? '$' + c.revenue.toLocaleString('en-AU', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—'}</td>
+    </tr>`).join('');
   }
 
   // Timeslot popularity chart
