@@ -178,7 +178,7 @@ function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
     cancellation_note:     a.cancellation_note || a.cancellation_reason || null,
     treatment_note_status: Number(a.treatment_note_status) || 0,
     is_group:              isGroup,
-    attendee_count:        isGroup ? (Array.isArray(a.attendees) ? a.attendees.length : (a.attendee_ids ? a.attendee_ids.length : 1)) : 1,
+    attendee_count:        isGroup ? (Array.isArray(a.patient_ids) ? a.patient_ids.length : (a.max_attendees || 1)) : 1,
     status_clean:          status,
     is_completed:          status === 'completed',
     is_dna:                status === 'dna',
@@ -254,8 +254,7 @@ async function syncAppointments() {
     console.log('  Group active: ' + groupActive.length);
     if (groupActive.length > 0) {
       console.log('  [Debug] Group appt keys:', Object.keys(groupActive[0]).join(', '));
-      console.log('  [Debug] attendees field:', JSON.stringify(groupActive[0].attendees).slice(0, 200));
-      console.log('  [Debug] attendee_ids field:', JSON.stringify(groupActive[0].attendee_ids).slice(0, 200));
+      console.log('  [Debug] patient_ids:', JSON.stringify(groupActive[0].patient_ids || []).slice(0, 200));
       console.log('  [Debug] max_attendees:', groupActive[0].max_attendees);
     }
 
