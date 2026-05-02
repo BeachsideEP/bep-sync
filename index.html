@@ -1222,14 +1222,7 @@ async function buildGrowthTab() {
       const nowISO = new Date().toISOString();
       const appts = apptRes.appointments || [];
 
-      // Filter invoices to only those linked to appointments in this period.
-      // This ties revenue to appointment date rather than invoice created_at.
-      const periodApptIds = new Set(appts.map(a => String(a.id)));
-      const allInvoices = (invRes.invoices || []);
-      const invoices = allInvoices.filter(inv => {
-        const aid = String(inv.appointment_id || '');
-        return aid && periodApptIds.has(aid);
-      });
+      const invoices = (invRes.invoices || []);
       const indiv = appts.filter(a => !isGroup(a) && a.starts_at <= nowISO);
       const classes = appts.filter(a => isGroup(a) && !isCancelled(a) && a.starts_at <= nowISO);
       const cancelled = indiv.filter(isCancelled);
