@@ -540,7 +540,7 @@
           <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers this period</div></div>
           <div class="stat-card"><div class="stat-label">Referred Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">new patients this period</div></div>
           <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">all time</div></div>
-          <div class="stat-card"><div class="stat-label">Est. Revenue</div><div class="stat-value c-success" id="ref-revenue">—</div><div class="stat-sub">from referred patients</div></div>
+          <div class="stat-card"><div class="stat-label">Est. Revenue</div><div class="stat-value c-success" id="ref-revenue">—</div><div class="stat-sub">from referred patients this period</div></div>
         </div>
 
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px;margin-bottom:24px;">
@@ -674,8 +674,10 @@
                 <th>New Clients</th>
                 <th>Class Attendees</th>
                 <th>Revenue</th>
+                <th>Costs</th>
+                <th>Profit / Loss</th>
               </tr></thead>
-              <tbody id="gr-table-body"><tr><td colspan="10" class="empty">Load data to view</td></tr></tbody>
+              <tbody id="gr-table-body"><tr><td colspan="12" class="empty">Load data to view</td></tr></tbody>
             </table>
           </div>
         </div>
@@ -1164,7 +1166,7 @@ function setGrowthWindow(n, btn) {
 }
 
 async function buildGrowthTab() {
-  document.getElementById('gr-table-body').innerHTML = '<tr><td colspan="10" class="empty">Loading...</td></tr>';
+  document.getElementById('gr-table-body').innerHTML = '<tr><td colspan="12" class="empty">Loading...</td></tr>';
 
   // Calculate date range based on period and window
   const now = new Date();
@@ -1217,9 +1219,10 @@ async function buildGrowthTab() {
         apiGet('get_invoices_range', { from: p.from, to: p.to }),
       ]);
 
+      const nowISO = new Date().toISOString();
       const appts = apptRes.appointments || [];
-      const indiv = appts.filter(a => !isGroup(a));
-      const classes = appts.filter(a => isGroup(a) && !isCancelled(a));
+      const indiv = appts.filter(a => !isGroup(a) && a.starts_at <= nowISO);
+      const classes = appts.filter(a => isGroup(a) && !isCancelled(a) && a.starts_at <= nowISO);
       const cancelled = indiv.filter(isCancelled);
       const attended = indiv.filter(a => !isCancelled(a) && isAttended(a));
       const dna = indiv.filter(isDNA);
@@ -1227,22 +1230,17 @@ async function buildGrowthTab() {
       const attendRate = booked > 0 ? Math.round(attended.length / booked * 100) : 0;
       const cancelRate = (booked + cancelled.length) > 0 ? Math.round(cancelled.length / (booked + cancelled.length) * 100) : 0;
 
-      // Build slot -> unique patient count from individual (non-group) rows
-      const overviewSlotMap = {};
-      apptRes.appointments.forEach(a => {
-        if (!isGroup(a) && !isCancelled(a) && a._patId) {
-          const slot = a.starts_at ? a.starts_at.slice(0, 16) : '';
-          if (slot) {
-            if (!overviewSlotMap[slot]) overviewSlotMap[slot] = new Set();
-            overviewSlotMap[slot].add(a._patId);
-          }
-        }
+      // Class attendees: group by session (starts_at slot), take max attendee_count per slot.
+      // The worker now populates attendee_count from the appointment_attendees table.
+      // Group rows: one row per session — attendee_count IS the headcount for that session.
+      const sessionAttendees = {};
+      classes.forEach(a => {
+        const slot = a.starts_at ? a.starts_at.slice(0, 16) : String(a.id);
+        const count = a.attendee_count || 0;
+        sessionAttendees[slot] = Math.max(sessionAttendees[slot] || 0, count);
       });
-      const classAttendees = classes.reduce((s, a) => {
-        if (a.attendee_count && a.attendee_count > 0) return s + a.attendee_count;
-        const slot = a.starts_at ? a.starts_at.slice(0, 16) : '';
-        return s + (overviewSlotMap[slot] ? overviewSlotMap[slot].size : 0);
-      }, 0);
+      const classAttendees = Object.values(sessionAttendees).reduce((s, n) => s + n, 0);
+      const classSessions = Object.keys(sessionAttendees).length;
       const invoices = (invRes.invoices || []);
       const revenue = invoices.reduce((s, inv) => s + parseFloat(inv.total_amount || 0), 0);
       const newClients = (patRes.patients || []).length;
@@ -1258,9 +1256,9 @@ async function buildGrowthTab() {
         pracAppts[name] = (pracAppts[name] || 0) + 1;
       });
 
-      return { ...p, attended: attended.length, cancelled: cancelled.length, dna: dna.length, attendRate, cancelRate, classAttendees, revenue, newClients, pracRev, pracAppts };
+      return { ...p, attended: attended.length, cancelled: cancelled.length, dna: dna.length, attendRate, cancelRate, classAttendees, classSessions, revenue, newClients, pracRev, pracAppts };
     } catch(e) {
-      return { ...p, attended: 0, cancelled: 0, dna: 0, attendRate: 0, cancelRate: 0, classAttendees: 0, revenue: 0, newClients: 0, pracRev: {}, pracAppts: {} };
+      return { ...p, attended: 0, cancelled: 0, dna: 0, attendRate: 0, cancelRate: 0, classAttendees: 0, classSessions: 0, revenue: 0, newClients: 0, pracRev: {}, pracAppts: {} };
     }
   }));
 
@@ -1280,7 +1278,9 @@ async function buildGrowthTab() {
   document.getElementById('gr-avg-rev-trend').textContent = trend(recentHalf, olderHalf, 'revenue');
   document.getElementById('gr-total-clients').textContent = periodData.reduce((s, d) => s + d.newClients, 0);
   document.getElementById('gr-clients-trend').textContent = trend(recentHalf, olderHalf, 'newClients');
-  const avgClass = avg(periodData.filter(d => d.classAttendees > 0), 'classAttendees');
+  const totalSessions = periodData.reduce((s, d) => s + (d.classSessions || 0), 0);
+  const totalClassAttendees = periodData.reduce((s, d) => s + (d.classAttendees || 0), 0);
+  const avgClass = totalSessions > 0 ? totalClassAttendees / totalSessions : 0;
   document.getElementById('gr-avg-class').textContent = avgClass > 0 ? avgClass.toFixed(1) : '—';
   document.getElementById('gr-new-per-month').textContent = Math.round(avg(periodData, 'newClients'));
   document.getElementById('gr-new-trend').textContent = trend(recentHalf, olderHalf, 'newClients');
@@ -1371,9 +1371,21 @@ async function buildGrowthTab() {
     { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: true, labels: { color: '#94a3b8', font: { size: 10 }, boxWidth: 12 } } }, scales: { x: { stacked: true, ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }, y: { stacked: true, ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } } } }
   );
 
-  // Table
-  document.getElementById('gr-table-body').innerHTML = [...periodData].reverse().map(d => `
-    <tr>
+  // Table — with editable Costs and calculated Profit/Loss
+  // Costs are persisted in localStorage keyed by period "from" date
+  function loadCost(periodFrom) {
+    try { return parseFloat(localStorage.getItem('bep_cost_' + periodFrom) || '0') || 0; } catch(e) { return 0; }
+  }
+  function saveCost(periodFrom, value) {
+    try { localStorage.setItem('bep_cost_' + periodFrom, value); } catch(e) {}
+  }
+
+  document.getElementById('gr-table-body').innerHTML = [...periodData].reverse().map(d => {
+    const cost = loadCost(d.from);
+    const profit = Math.round(d.revenue) - cost;
+    const profitColour = profit >= 0 ? 'var(--success)' : 'var(--danger)';
+    const profitStr = (profit >= 0 ? '+$' : '-$') + Math.abs(profit).toLocaleString();
+    return `<tr>
       <td style="font-size:12px;font-weight:600;">${d.label}</td>
       <td class="mono">${d.attended + d.dna + d.cancelled}</td>
       <td class="mono c-success">${d.attended}</td>
@@ -1384,7 +1396,41 @@ async function buildGrowthTab() {
       <td class="mono c-sky">${d.newClients}</td>
       <td class="mono">${d.classAttendees || '—'}</td>
       <td class="mono c-success">$${Math.round(d.revenue).toLocaleString()}</td>
-    </tr>`).join('');
+      <td style="padding:8px 22px;">
+        <div style="display:flex;align-items:center;gap:4px;">
+          <span style="color:var(--muted2);font-size:13px;">$</span>
+          <input
+            type="number"
+            min="0"
+            step="100"
+            value="${cost || ''}"
+            placeholder="0"
+            data-period="${d.from}"
+            onchange="(function(el){
+              const v = parseFloat(el.value) || 0;
+              localStorage.setItem('bep_cost_' + el.dataset.period, v);
+              const row = el.closest('tr');
+              const rev = parseFloat(row.dataset.revenue);
+              const profit = rev - v;
+              const cell = row.querySelector('.profit-cell');
+              cell.textContent = (profit >= 0 ? '+$' : '-$') + Math.abs(Math.round(profit)).toLocaleString();
+              cell.style.color = profit >= 0 ? 'var(--success)' : 'var(--danger)';
+            })(this)"
+            style="width:90px;background:var(--surface2);border:1px solid var(--border2);border-radius:6px;padding:5px 8px;font-size:13px;font-family:'DM Mono',monospace;color:var(--text);outline:none;"
+            onfocus="this.style.borderColor='var(--sky)'"
+            onblur="this.style.borderColor='var(--border2)'"
+          >
+        </div>
+      </td>
+      <td class="mono profit-cell" style="color:${profitColour};">${profitStr}</td>
+    </tr>`;
+  }).join('');
+
+  // Stamp revenue onto each row as a data attribute for the inline calc
+  document.getElementById('gr-table-body').querySelectorAll('tr').forEach((row, i) => {
+    const d = [...periodData].reverse()[i];
+    if (d) row.dataset.revenue = Math.round(d.revenue);
+  });
 }
 
 // Auto-load growth tab when switched to
@@ -1453,8 +1499,18 @@ function buildReferralHub(periodPatients, allTimePatients, appts, invoices) {
   const allTimeSorted = Object.entries(allSources).sort((a,b) => b[1]-a[1]);
   const topAllTime = allTimeSorted[0]; // top referrer by all-time volume
 
+  // Est. Revenue: sum ALL invoices (all-time) for patients who were referred this period.
+  // Using only period invoices undercounts — referred patients generate revenue beyond the selected window.
+  // _refInvoices holds period invoices; for all-time revenue we match against allTimePatients invoices.
+  // Since we only have period invoices fetched, we sum those belonging to any patient ever referred
+  // (all-time referred patient IDs), not just patients registered this period.
   const periodPatIds = new Set(periodWithSource.map(p => String(p.id)));
-  const periodRevenue = _refInvoices.reduce((s,inv) => s + (periodPatIds.has(String(inv.patient_id)) ? parseFloat(inv.total_amount||0) : 0), 0);
+  const allTimeRefPatIds = new Set((allTimePatients || []).filter(p => p.referral_source).map(p => String(p.id)));
+  // Revenue from period invoices for ALL referred patients (not just those who registered this period)
+  const periodRevenue = _refInvoices.reduce((s, inv) => {
+    const pid = String(inv.patient_id || '');
+    return s + (allTimeRefPatIds.has(pid) ? parseFloat(inv.total_amount || 0) : 0);
+  }, 0);
 
   document.getElementById('ref-total-sources').textContent = periodSources.size;
   document.getElementById('ref-total-patients').textContent = periodWithSource.length;
