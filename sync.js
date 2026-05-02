@@ -1,10 +1,10 @@
 // BEP-SYNC-V7
 // Fixes vs V6:
-//   1. Writes to 'dashboard_appointments' (matches worker) instead of 'appointments'
-//   2. Stores patient_name and practitioner_name directly on each appointment row
-//   3. Stores issue_date on invoices (used by worker for correct revenue periods)
-//   4. Uses total_amount not net_amount for invoices (matches Cliniko report figures)
-//   5. Builds practitioner name lookup from synced practitioners before mapping appointments
+//   1. Stores issue_date on invoices — worker filters by this for correct revenue periods
+//   2. Uses total_amount (not net_amount) for invoices — matches Cliniko revenue reports
+//   3. patient_name and practitioner_name come from the dashboard_appointments VIEW
+//      (which joins patients and practitioners) — sync does NOT store them directly
+//   Note: dashboard_appointments is a VIEW on the appointments table — sync writes to appointments
 require('dotenv').config();
 const https = require('https');
 const http = require('http');
@@ -128,7 +128,6 @@ function extractId(obj) {
   return null;
 }
 
-// ── FETCH APPOINTMENT TYPES LOOKUP ───────────────────────────
 async function fetchAppointmentTypes() {
   console.log('  Fetching appointment types...');
   const items = await clinikoFetchAll('appointment_types?per_page=' + PER_PAGE, 'appointment_types');
@@ -142,20 +141,7 @@ async function fetchAppointmentTypes() {
   return lookup;
 }
 
-// ── FETCH PRACTITIONER NAME LOOKUP from Supabase ─────────────
-// We use the already-synced practitioners table so we don't need
-// an extra Cliniko API call during appointment mapping.
-async function fetchPractitionerNames() {
-  const data = await httpGet(SUPABASE_URL + '/rest/v1/practitioners?select=id,name&limit=500', supabaseHeaders);
-  const lookup = {};
-  (data || []).forEach(p => { lookup[p.id] = p.name; });
-  return lookup;
-}
-
-// ── MAP APPOINTMENT TO DATABASE ROW ──────────────────────────
-// FIX: writes patient_name and practitioner_name directly
-// FIX: writes to dashboard_appointments (matches worker table name)
-function mapAppointment(a, isCancelled, apptTypeLookup, pracNameLookup, patNameLookup, forceGroup) {
+function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
   const pracId = extractId(a.practitioner);
   const patId  = extractId(a.patient);
 
@@ -177,18 +163,10 @@ function mapAppointment(a, isCancelled, apptTypeLookup, pracNameLookup, patNameL
     status = 'booked';
   }
 
-  // Resolve names — patient name from Cliniko object, practitioner from lookup
-  const patFirst  = (a.patient && a.patient.first_name) || '';
-  const patLast   = (a.patient && a.patient.last_name)  || '';
-  const patName   = (patFirst + ' ' + patLast).trim() || (patId ? (patNameLookup[patId] || null) : null);
-  const pracName  = pracId ? (pracNameLookup[pracId] || null) : null;
-
   return {
     id:                    Number(a.id),
     patient_id:            patId,
     practitioner_id:       pracId,
-    patient_name:          patName,           // FIX: store name directly
-    practitioner_name:     pracName,          // FIX: store name directly
     appointment_type:      apptTypeName,
     starts_at:             a.starts_at,
     ends_at:               a.ends_at || null,
@@ -203,7 +181,9 @@ function mapAppointment(a, isCancelled, apptTypeLookup, pracNameLookup, patNameL
     is_completed:          status === 'completed',
     is_dna:                status === 'dna',
     is_cancelled:          status === 'cancelled',
-    actual_revenue:        0,                 // updated later by updateAppointmentRevenue()
+    actual_revenue:        0,
+    created_at:            a.created_at,
+    updated_at:            a.updated_at,
   };
 }
 
@@ -250,46 +230,32 @@ async function syncAppointments() {
   try {
     const apptTypeLookup = await fetchAppointmentTypes();
 
-    // FIX: fetch practitioner names BEFORE mapping appointments
-    const pracNameLookup = await fetchPractitionerNames();
-    console.log('  Practitioner name lookup: ' + Object.keys(pracNameLookup).length + ' entries');
-
-    // Patient name lookup — we build this from the active appointments themselves
-    // since the patient object is embedded in each appointment response
-    const patNameLookup = {}; // filled during mapping from embedded patient data
-
-    // Active appointments
     const active = await clinikoFetchAll(
       'individual_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
       'individual_appointments');
     console.log('  Active: ' + active.length);
 
-    // Cancelled appointments
     const cancelled = await clinikoFetchAll(
       'individual_appointments/cancelled?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
       'individual_appointments');
     console.log('  Cancelled: ' + cancelled.length);
 
-    // Group appointments (classes)
     console.log('  Fetching group appointments (classes)...');
     const groupActive = await clinikoFetchAll(
       'group_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
       'group_appointments');
     console.log('  Group active: ' + groupActive.length);
     if (groupActive.length > 0) {
-      console.log('  [Debug] Group appt keys:', Object.keys(groupActive[0]).join(', '));
-      console.log('  [Debug] patient_ids:', JSON.stringify(groupActive[0].patient_ids || []).slice(0, 200));
+      console.log('  [Debug] patient_ids sample:', JSON.stringify(groupActive[0].patient_ids || []).slice(0, 200));
     }
 
-    // Map and dedup — cancelled version wins
     const byId = {};
-    active.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, pracNameLookup, patNameLookup, false); });
-    cancelled.forEach(a => { byId[a.id] = mapAppointment(a, true, apptTypeLookup, pracNameLookup, patNameLookup, false); });
-    groupActive.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, pracNameLookup, patNameLookup, true); });
+    active.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, false); });
+    cancelled.forEach(a => { byId[a.id] = mapAppointment(a, true, apptTypeLookup, false); });
+    groupActive.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, true); });
     const rows = Object.values(byId);
 
-    // FIX: write to 'dashboard_appointments' to match what the worker queries
-    await supabaseUpsert('dashboard_appointments', rows);
+    await supabaseUpsert('appointments', rows);
     await updateLastSync('appointments');
 
     const c    = rows.filter(r => r.is_cancelled).length;
@@ -310,13 +276,7 @@ async function syncInvoices() {
       'invoices?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'invoices');
 
     const rows = items.map(inv => {
-      // FIX: use total_amount (= Invoice Amount in Cliniko export), not net_amount
-      // net_amount can be after-discount/tax which doesn't match Cliniko's own revenue reports
       const total = parseFloat(inv.total_amount) || parseFloat(inv.net_amount) || 0;
-
-      // FIX: store issue_date — this is what Cliniko uses in its revenue reports
-      // issue_date = the date on the invoice (matches appointment date in almost all cases)
-      // created_at = when the invoice record was made (can differ from issue_date)
       return {
         id:              Number(inv.id),
         patient_id:      extractId(inv.patient),
@@ -324,7 +284,7 @@ async function syncInvoices() {
         practitioner_id: extractId(inv.practitioner),
         total_amount:    total,
         status:          inv.status || null,
-        issue_date:      inv.issue_date || null,   // FIX: store issue_date
+        issue_date:      inv.issue_date || null,
         created_at:      inv.created_at,
         updated_at:      inv.updated_at,
       };
@@ -339,7 +299,6 @@ async function syncInvoices() {
 
 async function updateAppointmentRevenue() {
   console.log('\n Updating appointment revenue from invoices...');
-  // FIX: read from invoices table (which now has correct total_amount)
   const invoices = await httpGet(
     SUPABASE_URL + '/rest/v1/invoices?select=appointment_id,total_amount&appointment_id=not.is.null&limit=10000',
     supabaseHeaders);
@@ -351,8 +310,7 @@ async function updateAppointmentRevenue() {
   const updates = Object.entries(map);
   let done = 0;
   for (const [id, rev] of updates) {
-    // FIX: update dashboard_appointments not appointments
-    await httpRequest('PATCH', SUPABASE_URL + '/rest/v1/dashboard_appointments?id=eq.' + id,
+    await httpRequest('PATCH', SUPABASE_URL + '/rest/v1/appointments?id=eq.' + id,
       Object.assign({ 'Prefer': 'return=minimal' }, supabaseHeaders), { actual_revenue: rev });
     done++;
     if (done % 100 === 0) { console.log('  ... ' + done + '/' + updates.length); await sleep(200); }
