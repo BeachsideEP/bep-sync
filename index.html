@@ -515,7 +515,7 @@
 
         <div class="stat-grid-3" style="margin-bottom:24px;">
           <div class="stat-card"><div class="stat-label">Total Classes</div><div class="stat-value c-sky" id="cls-total">—</div><div class="stat-sub">in selected period</div></div>
-          <div class="stat-card"><div class="stat-label">Total Attendees</div><div class="stat-value c-success" id="cls-attendees">—</div><div class="stat-sub">across all classes</div></div>
+          <div class="stat-card"><div class="stat-label">Total Attendees</div><div class="stat-value c-success" id="cls-attendees">—</div><div class="stat-sub" id="cls-attendees-sub">across all classes</div></div>
           <div class="stat-card"><div class="stat-label">Est. Class Revenue</div><div class="stat-value c-success" id="cls-revenue">—</div><div class="stat-sub">from class invoices</div></div>
         </div>
 
@@ -1226,7 +1226,23 @@ async function buildGrowthTab() {
       const booked = attended.length + dna.length;
       const attendRate = booked > 0 ? Math.round(attended.length / booked * 100) : 0;
       const cancelRate = (booked + cancelled.length) > 0 ? Math.round(cancelled.length / (booked + cancelled.length) * 100) : 0;
-      const classAttendees = classes.reduce((s, a) => s + (a.attendee_count || 0), 0);
+
+      // Build slot -> unique patient count from individual (non-group) rows
+      const overviewSlotMap = {};
+      apptRes.appointments.forEach(a => {
+        if (!isGroup(a) && !isCancelled(a) && a._patId) {
+          const slot = a.starts_at ? a.starts_at.slice(0, 16) : '';
+          if (slot) {
+            if (!overviewSlotMap[slot]) overviewSlotMap[slot] = new Set();
+            overviewSlotMap[slot].add(a._patId);
+          }
+        }
+      });
+      const classAttendees = classes.reduce((s, a) => {
+        if (a.attendee_count && a.attendee_count > 0) return s + a.attendee_count;
+        const slot = a.starts_at ? a.starts_at.slice(0, 16) : '';
+        return s + (overviewSlotMap[slot] ? overviewSlotMap[slot].size : 0);
+      }, 0);
       const invoices = (invRes.invoices || []);
       const revenue = invoices.reduce((s, inv) => s + parseFloat(inv.total_amount || 0), 0);
       const newClients = (patRes.patients || []).length;
@@ -2013,6 +2029,21 @@ function buildClasses(appts, invoices) {
 
   // Group by individual session (each class date is its own row)
   const classMap = {}; // key: exact datetime
+
+  // Build a slot -> attendee count map from non-group individual appointments
+  // (Cliniko creates per-patient appointment rows when you "Add Client" to a class).
+  // These show up as non-group rows at the same starts_at with a real patient_id.
+  const slotAttendeeMap = {};
+  appts.forEach(a => {
+    if (!isGroup(a) && !isCancelled(a) && a._patId) {
+      const slot = a.starts_at ? a.starts_at.slice(0, 16) : '';
+      if (slot) {
+        if (!slotAttendeeMap[slot]) slotAttendeeMap[slot] = new Set();
+        slotAttendeeMap[slot].add(a._patId);
+      }
+    }
+  });
+
   classAppts.forEach(a => {
     const typeName = a.appointment_type_name || 'Unknown Class';
     const dt = new Date(a.starts_at);
@@ -2023,8 +2054,18 @@ function buildClasses(appts, invoices) {
     if (!classMap[sessionKey]) {
       classMap[sessionKey] = { name: typeName, date: dateStr, time: timeStr, starts_at: a.starts_at, attendees: 0, revenue: 0 };
     }
-    // Each group_appointment row = one session; use attendee_count directly
-    classMap[sessionKey].attendees += (a.attendee_count && a.attendee_count > 0) ? a.attendee_count : 0;
+
+    // Priority 1: attendee_count from worker (populated from appointment_attendees table)
+    if (a.attendee_count && a.attendee_count > 0) {
+      classMap[sessionKey].attendees = Math.max(classMap[sessionKey].attendees, a.attendee_count);
+    }
+    // Priority 2: count unique patient IDs from individual per-patient appointment rows at same slot
+    else {
+      const slotPatients = slotAttendeeMap[sessionKey];
+      if (slotPatients && slotPatients.size > 0) {
+        classMap[sessionKey].attendees = slotPatients.size;
+      }
+    }
   });
 
   // Match revenue from invoices — use appointment_id directly
@@ -2045,6 +2086,19 @@ function buildClasses(appts, invoices) {
 
   document.getElementById('cls-total').textContent = totalClasses;
   document.getElementById('cls-attendees').textContent = totalAttendees;
+
+  // Show a sub-label if attendee counts are still all zero (sync not yet updated)
+  const attendeeSubEl = document.getElementById('cls-attendees-sub');
+  if (attendeeSubEl) {
+    if (totalClasses > 0 && totalAttendees === 0) {
+      attendeeSubEl.textContent = '⚠ Requires sync script update';
+      attendeeSubEl.style.color = 'var(--warning)';
+    } else {
+      attendeeSubEl.textContent = 'across all classes';
+      attendeeSubEl.style.color = '';
+    }
+  }
+
   document.getElementById('cls-revenue').textContent = '$' + totalRevenue.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
   const tbody = document.getElementById('cls-table-body');
@@ -2055,7 +2109,7 @@ function buildClasses(appts, invoices) {
       <td class="fw">${c.name}</td>
       <td style="font-size:12px;color:var(--muted2);">${c.date}</td>
       <td style="font-size:12px;color:var(--muted2);">${c.time}</td>
-      <td class="mono c-sky">${c.attendees}</td>
+      <td class="mono c-sky">${c.attendees > 0 ? c.attendees : '<span style="color:var(--muted)">—</span>'}</td>
       <td class="mono c-success">${c.revenue > 0 ? '$' + c.revenue.toLocaleString('en-AU', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—'}</td>
     </tr>`).join('');
   }
