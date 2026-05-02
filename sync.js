@@ -204,8 +204,6 @@ function mapAppointment(a, isCancelled, apptTypeLookup, pracNameLookup, patNameL
     is_dna:                status === 'dna',
     is_cancelled:          status === 'cancelled',
     actual_revenue:        0,                 // updated later by updateAppointmentRevenue()
-    created_at:            a.created_at,
-    updated_at:            a.updated_at,
   };
 }
 
