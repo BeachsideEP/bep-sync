@@ -1,15 +1,18 @@
-// BEP-SYNC-V8 (REWRITTEN - SAFE & DETERMINISTIC)
-
+// BEP-SYNC-V7
+// Fixes vs V6:
+//   1. Stores issue_date on invoices — worker filters by this for correct revenue periods
+//   2. Uses total_amount (not net_amount) for invoices — matches Cliniko revenue reports
+//   3. patient_name and practitioner_name come from the dashboard_appointments VIEW
+//      (which joins patients and practitioners) — sync does NOT store them directly
+//   Note: dashboard_appointments is a VIEW on the appointments table — sync writes to appointments
 require('dotenv').config();
 const https = require('https');
 const http = require('http');
 
 const CLINIKO_BASE = 'https://api.au2.cliniko.com/v1';
 const CLINIKO_KEY = process.env.CLINIKO_API_KEY;
-
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY;
-
 const PER_PAGE = 100;
 
 if (!CLINIKO_KEY || !SUPABASE_URL || !SUPABASE_KEY) {
@@ -17,23 +20,19 @@ if (!CLINIKO_KEY || !SUPABASE_URL || !SUPABASE_KEY) {
   process.exit(1);
 }
 
-// -------------------- HTTP --------------------
-
 function httpGet(url, headers) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
-
     lib.get(url, { headers }, (res) => {
       let body = '';
-
-      res.on('data', c => body += c);
-
+      res.on('data', chunk => body += chunk);
       res.on('end', () => {
         if (res.statusCode >= 400) {
-          return reject(new Error(`HTTP ${res.statusCode}: ${body.slice(0, 300)}`));
+          reject(new Error('HTTP ' + res.statusCode + ' on ' + url + ': ' + body.slice(0, 300)));
+          return;
         }
         try { resolve(JSON.parse(body)); }
-        catch { reject(new Error('JSON parse error')); }
+        catch(e) { reject(new Error('JSON parse: ' + body.slice(0, 200))); }
       });
     }).on('error', reject);
   });
@@ -42,232 +41,299 @@ function httpGet(url, headers) {
 function httpRequest(method, url, headers, body) {
   return new Promise((resolve, reject) => {
     const payload = body ? JSON.stringify(body) : '';
-    const lib = url.startsWith('https') ? https : http;
-
-    const req = lib.request(url, {
+    const opts = {
       method,
-      headers: {
-        ...headers,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(payload)
-      }
-    }, (res) => {
+      headers: Object.assign({ 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) }, headers),
+    };
+    const lib = url.startsWith('https') ? https : http;
+    const req = lib.request(new URL(url), opts, (res) => {
       let data = '';
-      res.on('data', c => data += c);
+      res.on('data', chunk => data += chunk);
       res.on('end', () => {
         if (res.statusCode >= 400) {
-          return reject(new Error(`HTTP ${res.statusCode}: ${data.slice(0, 300)}`));
+          reject(new Error('HTTP ' + res.statusCode + ' ' + method + ' ' + url + ': ' + data.slice(0, 300)));
+          return;
         }
-        resolve(data ? JSON.parse(data) : {});
+        try { resolve(data ? JSON.parse(data) : {}); }
+        catch(e) { resolve({}); }
       });
     });
-
     req.on('error', reject);
     if (payload) req.write(payload);
     req.end();
   });
 }
 
-// -------------------- HEADERS --------------------
-
 const clinikoHeaders = {
-  Authorization: 'Basic ' + Buffer.from(CLINIKO_KEY + ':').toString('base64'),
-  Accept: 'application/json',
-  'User-Agent': 'BEP-Sync-V8'
+  'Authorization': 'Basic ' + Buffer.from(CLINIKO_KEY + ':').toString('base64'),
+  'Accept': 'application/json',
+  'User-Agent': 'BEP-Dashboard-Sync/7.0 (admin@beachsideep.com.au)',
 };
+
+async function clinikoFetchAll(path, entityKey) {
+  const results = [];
+  let url = CLINIKO_BASE + '/' + path;
+  let page = 0;
+  while (url) {
+    page++;
+    if (page <= 2 || page % 10 === 0) console.log('  [Cliniko] page ' + page + ': ' + url.replace(CLINIKO_BASE, '').split('?')[0]);
+    const data = await httpGet(url, clinikoHeaders);
+    const items = data[entityKey] || [];
+    results.push(...items);
+    await sleep(350);
+    url = (data.links && data.links.next) ? data.links.next : null;
+  }
+  return results;
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 const supabaseHeaders = {
-  apikey: SUPABASE_KEY,
-  Authorization: 'Bearer ' + SUPABASE_KEY
+  'apikey': SUPABASE_KEY,
+  'Authorization': 'Bearer ' + SUPABASE_KEY,
 };
 
-// -------------------- CORE HELPERS --------------------
+async function supabaseUpsert(table, rows, batchSize) {
+  batchSize = batchSize || 200;
+  if (!rows.length) return;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    await httpRequest('POST', SUPABASE_URL + '/rest/v1/' + table,
+      Object.assign({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }, supabaseHeaders),
+      rows.slice(i, i + batchSize));
+  }
+}
 
-const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function getLastSync(entity) {
+  const data = await httpGet(SUPABASE_URL + '/rest/v1/sync_state?entity=eq.' + entity + '&select=last_synced_at', supabaseHeaders);
+  return (data[0] && data[0].last_synced_at) ? data[0].last_synced_at : '2000-01-01T00:00:00Z';
+}
+
+async function updateLastSync(entity) {
+  await httpRequest('PATCH', SUPABASE_URL + '/rest/v1/sync_state?entity=eq.' + entity,
+    Object.assign({ 'Prefer': 'return=minimal' }, supabaseHeaders),
+    { last_synced_at: new Date().toISOString() });
+}
+
+async function writeSyncLog(entity, startedAt, records, status, err) {
+  await httpRequest('POST', SUPABASE_URL + '/rest/v1/sync_logs',
+    Object.assign({ 'Prefer': 'return=minimal' }, supabaseHeaders),
+    { entity, started_at: startedAt, finished_at: new Date().toISOString(), records_processed: records, status, error_message: err || null });
+}
 
 function extractId(obj) {
   if (!obj) return null;
-  if (obj.links?.self) return Number(obj.links.self.split('/').pop());
+  const link = obj.links && obj.links.self ? obj.links.self : '';
+  if (link) return Number(link.split('/').pop());
   if (obj.id) return Number(obj.id);
   return null;
 }
 
-async function fetchAll(path, key) {
-  let url = `${CLINIKO_BASE}/${path}`;
-  const out = [];
-
-  while (url) {
-    const data = await httpGet(url, clinikoHeaders);
-    out.push(...(data[key] || []));
-    url = data.links?.next || null;
-    await sleep(250);
-  }
-
-  return out;
+async function fetchAppointmentTypes() {
+  console.log('  Fetching appointment types...');
+  const items = await clinikoFetchAll('appointment_types?per_page=' + PER_PAGE, 'appointment_types');
+  const lookup = {};
+  items.forEach(t => {
+    const selfLink = t.links && t.links.self ? t.links.self : '';
+    const idStr = selfLink ? selfLink.split('/').pop() : String(t.id);
+    lookup[idStr] = t.name;
+  });
+  console.log('  Found ' + items.length + ' appointment types');
+  return lookup;
 }
 
-// -------------------- UPSERT (STRICT) --------------------
+function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
+  const pracId = extractId(a.practitioner);
+  const patId  = extractId(a.patient);
 
-async function upsert(table, rows) {
-  if (!rows.length) return;
+  const apptTypeLink = (a.appointment_type && a.appointment_type.links && a.appointment_type.links.self)
+    ? a.appointment_type.links.self : '';
+  const apptTypeId = apptTypeLink ? apptTypeLink.split('/').pop() : null;
+  const apptTypeName = apptTypeId ? (apptTypeLookup[apptTypeId] || null) : null;
 
-  const batchSize = 200;
+  const isGroup = forceGroup || (apptTypeName ? /class|group/i.test(apptTypeName) : false);
 
-  for (let i = 0; i < rows.length; i += batchSize) {
-    const batch = rows.slice(i, i + batchSize);
-
-    await httpRequest(
-      'POST',
-      `${SUPABASE_URL}/rest/v1/${table}?on_conflict=id`,
-      {
-        ...supabaseHeaders,
-        Prefer: 'resolution=merge-duplicates,return=minimal'
-      },
-      batch
-    );
+  let status;
+  if (isCancelled) {
+    status = 'cancelled';
+  } else if (a.did_not_arrive === true) {
+    status = 'dna';
+  } else if (new Date(a.starts_at) < new Date()) {
+    status = 'completed';
+  } else {
+    status = 'booked';
   }
-}
-
-// -------------------- APPOINTMENTS --------------------
-
-function mapAppointment(a, typeMap) {
-  const apptTypeId = a.appointment_type?.links?.self?.split('/').pop() || null;
-
-  const status =
-    a.cancelled_at ? 'cancelled' :
-    a.did_not_arrive ? 'dna' :
-    new Date(a.starts_at) < new Date() ? 'completed' :
-    'booked';
 
   return {
-    id: Number(a.id),
-
-    patient_id: extractId(a.patient),
-    practitioner_id: extractId(a.practitioner),
-
-    appointment_type: typeMap[apptTypeId] || null,
-
-    starts_at: a.starts_at,
-    ends_at: a.ends_at || null,
-
-    did_not_arrive: !!a.did_not_arrive,
-    patient_arrived: !!a.patient_arrived,
-
-    status_clean: status,
-
-    is_completed: status === 'completed',
-    is_cancelled: status === 'cancelled',
-    is_dna: status === 'dna',
-
-    is_group: false, // FIX: no dual-source logic anymore
-
-    attendee_count: a.max_attendees || 1,
-
-    cancelled_at: a.cancelled_at || null,
-
-    created_at: a.created_at,
-    updated_at: a.updated_at
+    id:                    Number(a.id),
+    patient_id:            patId,
+    practitioner_id:       pracId,
+    appointment_type:      apptTypeName,
+    starts_at:             a.starts_at,
+    ends_at:               a.ends_at || null,
+    did_not_arrive:        a.did_not_arrive === true,
+    patient_arrived:       a.patient_arrived === true,
+    cancelled_at:          isCancelled ? (a.cancelled_at || a.updated_at || a.created_at) : null,
+    cancellation_note:     a.cancellation_note || a.cancellation_reason || null,
+    treatment_note_status: Number(a.treatment_note_status) || 0,
+    is_group:              isGroup,
+    attendee_count:        isGroup ? (Array.isArray(a.patient_ids) ? a.patient_ids.length : (a.max_attendees || 1)) : 1,
+    status_clean:          status,
+    is_completed:          status === 'completed',
+    is_dna:                status === 'dna',
+    is_cancelled:          status === 'cancelled',
+    actual_revenue:        0,
+    created_at:            a.created_at,
+    updated_at:            a.updated_at,
   };
 }
 
-// -------------------- SYNC TASKS --------------------
-
-async function syncAppointmentTypes() {
-  const items = await fetchAll('appointment_types?per_page=100', 'appointment_types');
-
-  const map = {};
-  items.forEach(t => {
-    const id = t.links?.self?.split('/').pop() || t.id;
-    map[id] = t.name;
-  });
-
-  return map;
-}
-
-async function syncAppointments() {
-  const types = await syncAppointmentTypes();
-
-  const active = await fetchAll(
-    `individual_appointments?per_page=${PER_PAGE}`,
-    'individual_appointments'
-  );
-
-  const cancelled = await fetchAll(
-    `individual_appointments/cancelled?per_page=${PER_PAGE}`,
-    'individual_appointments'
-  );
-
-  const all = new Map();
-
-  // deterministic merge: same source rules only
-  [...active, ...cancelled].forEach(a => {
-    all.set(a.id, mapAppointment(a, types));
-  });
-
-  await upsert('appointments', [...all.values()]);
+async function syncPractitioners() {
+  const startedAt = new Date().toISOString();
+  console.log('\n Syncing practitioners...');
+  try {
+    const items = await clinikoFetchAll('practitioners?per_page=' + PER_PAGE, 'practitioners');
+    const rows = items.map(p => ({
+      id: Number(p.id), name: (p.first_name + ' ' + p.last_name).trim(),
+      first_name: p.first_name, last_name: p.last_name,
+      active: !p.archived_at, created_at: p.created_at, updated_at: p.updated_at,
+    }));
+    await supabaseUpsert('practitioners', rows);
+    await updateLastSync('practitioners');
+    await writeSyncLog('practitioners', startedAt, rows.length, 'success');
+    console.log('  OK: ' + rows.length + ' practitioners');
+  } catch(e) { await writeSyncLog('practitioners', startedAt, 0, 'error', e.message); throw e; }
 }
 
 async function syncPatients() {
-  const items = await fetchAll('patients?per_page=100', 'patients');
-
-  await upsert('patients', items.map(p => ({
-    id: Number(p.id),
-    first_name: p.first_name,
-    last_name: p.last_name,
-    dob: p.date_of_birth || null,
-    referral_source: p.referral_source || null,
-    created_at: p.created_at,
-    updated_at: p.updated_at
-  })));
+  const startedAt = new Date().toISOString();
+  const lastSync = await getLastSync('patients');
+  console.log('\n Syncing patients since ' + lastSync + '...');
+  try {
+    const items = await clinikoFetchAll(
+      'patients?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'patients');
+    const rows = items.map(p => ({
+      id: Number(p.id), first_name: p.first_name, last_name: p.last_name,
+      dob: p.date_of_birth || null, referral_source: p.referral_source || null,
+      created_at: p.created_at, updated_at: p.updated_at,
+    }));
+    await supabaseUpsert('patients', rows);
+    await updateLastSync('patients');
+    await writeSyncLog('patients', startedAt, rows.length, 'success');
+    console.log('  OK: ' + rows.length + ' patients');
+  } catch(e) { await writeSyncLog('patients', startedAt, 0, 'error', e.message); throw e; }
 }
 
-async function syncPractitioners() {
-  const items = await fetchAll('practitioners?per_page=100', 'practitioners');
+async function syncAppointments() {
+  const startedAt = new Date().toISOString();
+  const lastSync = await getLastSync('appointments');
+  console.log('\n Syncing appointments since ' + lastSync + '...');
+  try {
+    const apptTypeLookup = await fetchAppointmentTypes();
 
-  await upsert('practitioners', items.map(p => ({
-    id: Number(p.id),
-    name: `${p.first_name} ${p.last_name}`.trim(),
-    active: !p.archived_at,
-    created_at: p.created_at,
-    updated_at: p.updated_at
-  })));
+    const active = await clinikoFetchAll(
+      'individual_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
+      'individual_appointments');
+    console.log('  Active: ' + active.length);
+
+    const cancelled = await clinikoFetchAll(
+      'individual_appointments/cancelled?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
+      'individual_appointments');
+    console.log('  Cancelled: ' + cancelled.length);
+
+    console.log('  Fetching group appointments (classes)...');
+    const groupActive = await clinikoFetchAll(
+      'group_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
+      'group_appointments');
+    console.log('  Group active: ' + groupActive.length);
+    if (groupActive.length > 0) {
+      console.log('  [Debug] patient_ids sample:', JSON.stringify(groupActive[0].patient_ids || []).slice(0, 200));
+    }
+
+    const byId = {};
+    active.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, false); });
+    cancelled.forEach(a => { byId[a.id] = mapAppointment(a, true, apptTypeLookup, false); });
+    groupActive.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, true); });
+    const rows = Object.values(byId);
+
+    await supabaseUpsert('appointments', rows);
+    await updateLastSync('appointments');
+
+    const c    = rows.filter(r => r.is_cancelled).length;
+    const d    = rows.filter(r => r.is_dna).length;
+    const done = rows.filter(r => r.is_completed).length;
+    const grp  = rows.filter(r => r.is_group).length;
+    console.log('  OK: ' + rows.length + ' appts — completed=' + done + ' cancelled=' + c + ' dna=' + d + ' group/class=' + grp);
+    await writeSyncLog('appointments', startedAt, rows.length, 'success');
+  } catch(e) { await writeSyncLog('appointments', startedAt, 0, 'error', e.message); throw e; }
 }
 
 async function syncInvoices() {
-  const items = await fetchAll('invoices?per_page=100', 'invoices');
+  const startedAt = new Date().toISOString();
+  const lastSync = await getLastSync('invoices');
+  console.log('\n Syncing invoices since ' + lastSync + '...');
+  try {
+    const items = await clinikoFetchAll(
+      'invoices?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'invoices');
 
-  await upsert('invoices', items.map(inv => ({
-    id: Number(inv.id),
+    const rows = items.map(inv => {
+      const total = parseFloat(inv.total_amount) || parseFloat(inv.net_amount) || 0;
+      return {
+        id:              Number(inv.id),
+        patient_id:      extractId(inv.patient),
+        appointment_id:  extractId(inv.appointment),
+        practitioner_id: extractId(inv.practitioner),
+        total_amount:    total,
+        status:          inv.status || null,
+        issue_date:      inv.issue_date || null,
+        created_at:      inv.created_at,
+        updated_at:      inv.updated_at,
+      };
+    });
 
-    patient_id: extractId(inv.patient),
-    appointment_id: extractId(inv.appointment),
-    practitioner_id: extractId(inv.practitioner),
-
-    total_amount: Number(inv.total_amount || 0),
-
-    status: inv.status || null,
-
-    issue_date: inv.issue_date || null,
-
-    created_at: inv.created_at,
-    updated_at: inv.updated_at
-  })));
+    await supabaseUpsert('invoices', rows);
+    await updateLastSync('invoices');
+    await writeSyncLog('invoices', startedAt, rows.length, 'success');
+    console.log('  OK: ' + rows.length + ' invoices, $' + rows.reduce((s,r) => s+r.total_amount, 0).toFixed(2));
+  } catch(e) { await writeSyncLog('invoices', startedAt, 0, 'error', e.message); throw e; }
 }
 
-// -------------------- RUN --------------------
-
-async function run() {
-  console.log('BEP SYNC V8 START');
-
-  await syncPractitioners();
-  await syncPatients();
-  await syncAppointments();
-  await syncInvoices();
-
-  console.log('BEP SYNC V8 COMPLETE');
+async function updateAppointmentRevenue() {
+  console.log('\n Updating appointment revenue from invoices...');
+  const invoices = await httpGet(
+    SUPABASE_URL + '/rest/v1/invoices?select=appointment_id,total_amount&appointment_id=not.is.null&limit=10000',
+    supabaseHeaders);
+  const map = {};
+  for (const inv of invoices) {
+    if (!inv.appointment_id) continue;
+    map[inv.appointment_id] = (map[inv.appointment_id] || 0) + (parseFloat(inv.total_amount) || 0);
+  }
+  const updates = Object.entries(map);
+  let done = 0;
+  for (const [id, rev] of updates) {
+    await httpRequest('PATCH', SUPABASE_URL + '/rest/v1/appointments?id=eq.' + id,
+      Object.assign({ 'Prefer': 'return=minimal' }, supabaseHeaders), { actual_revenue: rev });
+    done++;
+    if (done % 100 === 0) { console.log('  ... ' + done + '/' + updates.length); await sleep(200); }
+  }
+  console.log('  OK: Revenue updated for ' + done + ' appointments');
 }
 
-run().catch(e => {
-  console.error('Fatal:', e);
-  process.exit(1);
-});
+async function runSync() {
+  console.log('============================================================');
+  console.log('BEP Sync V7 - ' + new Date().toISOString());
+  console.log('============================================================');
+  const t = Date.now();
+  let failed = false;
+  try { await syncPractitioners(); } catch(e) { console.error('FAILED practitioners:', e.message); failed = true; }
+  try { await syncPatients();      } catch(e) { console.error('FAILED patients:', e.message);      failed = true; }
+  try { await syncAppointments();  } catch(e) { console.error('FAILED appointments:', e.message);  failed = true; }
+  try { await syncInvoices();      } catch(e) { console.error('FAILED invoices:', e.message);      failed = true; }
+  if (!failed) {
+    try { await updateAppointmentRevenue(); } catch(e) { console.error('FAILED revenue:', e.message); }
+  }
+  console.log('\n============================================================');
+  console.log('Sync ' + (failed ? 'WITH ERRORS' : 'COMPLETE') + ' in ' + ((Date.now()-t)/1000).toFixed(1) + 's');
+  console.log('============================================================');
+}
+
+runSync().catch(e => { console.error('Fatal:', e); process.exit(1); });
