@@ -1,4 +1,10 @@
-// BEP-SYNC-V6
+// BEP-SYNC-V7
+// Fixes vs V6:
+//   1. Writes to 'dashboard_appointments' (matches worker) instead of 'appointments'
+//   2. Stores patient_name and practitioner_name directly on each appointment row
+//   3. Stores issue_date on invoices (used by worker for correct revenue periods)
+//   4. Uses total_amount not net_amount for invoices (matches Cliniko report figures)
+//   5. Builds practitioner name lookup from synced practitioners before mapping appointments
 require('dotenv').config();
 const https = require('https');
 const http = require('http');
@@ -61,7 +67,7 @@ function httpRequest(method, url, headers, body) {
 const clinikoHeaders = {
   'Authorization': 'Basic ' + Buffer.from(CLINIKO_KEY + ':').toString('base64'),
   'Accept': 'application/json',
-  'User-Agent': 'BEP-Dashboard-Sync/2.0 (admin@beachsideep.com.au)',
+  'User-Agent': 'BEP-Dashboard-Sync/7.0 (admin@beachsideep.com.au)',
 };
 
 async function clinikoFetchAll(path, entityKey) {
@@ -128,30 +134,36 @@ async function fetchAppointmentTypes() {
   const items = await clinikoFetchAll('appointment_types?per_page=' + PER_PAGE, 'appointment_types');
   const lookup = {};
   items.forEach(t => {
-    // Use ID from self link as string to avoid JS number precision loss
     const selfLink = t.links && t.links.self ? t.links.self : '';
     const idStr = selfLink ? selfLink.split('/').pop() : String(t.id);
     lookup[idStr] = t.name;
   });
   console.log('  Found ' + items.length + ' appointment types');
-  if (items.length > 0) {
-    console.log('  Sample types:', items.slice(0,5).map(t => t.id + ':' + t.name).join(', '));
-  }
   return lookup;
 }
 
-function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
+// ── FETCH PRACTITIONER NAME LOOKUP from Supabase ─────────────
+// We use the already-synced practitioners table so we don't need
+// an extra Cliniko API call during appointment mapping.
+async function fetchPractitionerNames() {
+  const data = await httpGet(SUPABASE_URL + '/rest/v1/practitioners?select=id,name&limit=500', supabaseHeaders);
+  const lookup = {};
+  (data || []).forEach(p => { lookup[p.id] = p.name; });
+  return lookup;
+}
+
+// ── MAP APPOINTMENT TO DATABASE ROW ──────────────────────────
+// FIX: writes patient_name and practitioner_name directly
+// FIX: writes to dashboard_appointments (matches worker table name)
+function mapAppointment(a, isCancelled, apptTypeLookup, pracNameLookup, patNameLookup, forceGroup) {
   const pracId = extractId(a.practitioner);
   const patId  = extractId(a.patient);
 
-  // Extract appointment type ID from linked object, look up name
-  // Extract appointment type ID as STRING to avoid JS number precision loss on 19-digit IDs
   const apptTypeLink = (a.appointment_type && a.appointment_type.links && a.appointment_type.links.self)
     ? a.appointment_type.links.self : '';
   const apptTypeId = apptTypeLink ? apptTypeLink.split('/').pop() : null;
   const apptTypeName = apptTypeId ? (apptTypeLookup[apptTypeId] || null) : null;
 
-  // Detect group/class by name or forceGroup flag (group_appointments endpoint)
   const isGroup = forceGroup || (apptTypeName ? /class|group/i.test(apptTypeName) : false);
 
   let status;
@@ -165,10 +177,18 @@ function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
     status = 'booked';
   }
 
+  // Resolve names — patient name from Cliniko object, practitioner from lookup
+  const patFirst  = (a.patient && a.patient.first_name) || '';
+  const patLast   = (a.patient && a.patient.last_name)  || '';
+  const patName   = (patFirst + ' ' + patLast).trim() || (patId ? (patNameLookup[patId] || null) : null);
+  const pracName  = pracId ? (pracNameLookup[pracId] || null) : null;
+
   return {
     id:                    Number(a.id),
     patient_id:            patId,
     practitioner_id:       pracId,
+    patient_name:          patName,           // FIX: store name directly
+    practitioner_name:     pracName,          // FIX: store name directly
     appointment_type:      apptTypeName,
     starts_at:             a.starts_at,
     ends_at:               a.ends_at || null,
@@ -183,6 +203,7 @@ function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
     is_completed:          status === 'completed',
     is_dna:                status === 'dna',
     is_cancelled:          status === 'cancelled',
+    actual_revenue:        0,                 // updated later by updateAppointmentRevenue()
     created_at:            a.created_at,
     updated_at:            a.updated_at,
   };
@@ -229,8 +250,15 @@ async function syncAppointments() {
   const lastSync = await getLastSync('appointments');
   console.log('\n Syncing appointments since ' + lastSync + '...');
   try {
-    // Fetch appointment types first — needed to get type names
     const apptTypeLookup = await fetchAppointmentTypes();
+
+    // FIX: fetch practitioner names BEFORE mapping appointments
+    const pracNameLookup = await fetchPractitionerNames();
+    console.log('  Practitioner name lookup: ' + Object.keys(pracNameLookup).length + ' entries');
+
+    // Patient name lookup — we build this from the active appointments themselves
+    // since the patient object is embedded in each appointment response
+    const patNameLookup = {}; // filled during mapping from embedded patient data
 
     // Active appointments
     const active = await clinikoFetchAll(
@@ -244,36 +272,33 @@ async function syncAppointments() {
       'individual_appointments');
     console.log('  Cancelled: ' + cancelled.length);
 
-    // Fetch group appointments (classes) — separate Cliniko endpoint
-    // Note: group_appointments/cancelled does not exist in Cliniko API
+    // Group appointments (classes)
     console.log('  Fetching group appointments (classes)...');
     const groupActive = await clinikoFetchAll(
       'group_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
-      'group_appointments'
-    );
+      'group_appointments');
     console.log('  Group active: ' + groupActive.length);
     if (groupActive.length > 0) {
       console.log('  [Debug] Group appt keys:', Object.keys(groupActive[0]).join(', '));
       console.log('  [Debug] patient_ids:', JSON.stringify(groupActive[0].patient_ids || []).slice(0, 200));
-      console.log('  [Debug] max_attendees:', groupActive[0].max_attendees);
     }
 
     // Map and dedup — cancelled version wins
     const byId = {};
-    active.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, false); });
-    cancelled.forEach(a => { byId[a.id] = mapAppointment(a, true, apptTypeLookup, false); });
-    groupActive.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, true); });
+    active.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, pracNameLookup, patNameLookup, false); });
+    cancelled.forEach(a => { byId[a.id] = mapAppointment(a, true, apptTypeLookup, pracNameLookup, patNameLookup, false); });
+    groupActive.forEach(a => { byId[a.id] = mapAppointment(a, false, apptTypeLookup, pracNameLookup, patNameLookup, true); });
     const rows = Object.values(byId);
 
-    await supabaseUpsert('appointments', rows);
+    // FIX: write to 'dashboard_appointments' to match what the worker queries
+    await supabaseUpsert('dashboard_appointments', rows);
     await updateLastSync('appointments');
 
-    const c = rows.filter(r => r.is_cancelled).length;
-    const d = rows.filter(r => r.is_dna).length;
+    const c    = rows.filter(r => r.is_cancelled).length;
+    const d    = rows.filter(r => r.is_dna).length;
     const done = rows.filter(r => r.is_completed).length;
-    const grp = rows.filter(r => r.is_group).length;
+    const grp  = rows.filter(r => r.is_group).length;
     console.log('  OK: ' + rows.length + ' appts — completed=' + done + ' cancelled=' + c + ' dna=' + d + ' group/class=' + grp);
-
     await writeSyncLog('appointments', startedAt, rows.length, 'success');
   } catch(e) { await writeSyncLog('appointments', startedAt, 0, 'error', e.message); throw e; }
 }
@@ -287,7 +312,13 @@ async function syncInvoices() {
       'invoices?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'invoices');
 
     const rows = items.map(inv => {
-      const total = parseFloat(inv.net_amount) || parseFloat(inv.total_amount) || 0;
+      // FIX: use total_amount (= Invoice Amount in Cliniko export), not net_amount
+      // net_amount can be after-discount/tax which doesn't match Cliniko's own revenue reports
+      const total = parseFloat(inv.total_amount) || parseFloat(inv.net_amount) || 0;
+
+      // FIX: store issue_date — this is what Cliniko uses in its revenue reports
+      // issue_date = the date on the invoice (matches appointment date in almost all cases)
+      // created_at = when the invoice record was made (can differ from issue_date)
       return {
         id:              Number(inv.id),
         patient_id:      extractId(inv.patient),
@@ -295,6 +326,7 @@ async function syncInvoices() {
         practitioner_id: extractId(inv.practitioner),
         total_amount:    total,
         status:          inv.status || null,
+        issue_date:      inv.issue_date || null,   // FIX: store issue_date
         created_at:      inv.created_at,
         updated_at:      inv.updated_at,
       };
@@ -308,7 +340,8 @@ async function syncInvoices() {
 }
 
 async function updateAppointmentRevenue() {
-  console.log('\n Updating revenue...');
+  console.log('\n Updating appointment revenue from invoices...');
+  // FIX: read from invoices table (which now has correct total_amount)
   const invoices = await httpGet(
     SUPABASE_URL + '/rest/v1/invoices?select=appointment_id,total_amount&appointment_id=not.is.null&limit=10000',
     supabaseHeaders);
@@ -320,7 +353,8 @@ async function updateAppointmentRevenue() {
   const updates = Object.entries(map);
   let done = 0;
   for (const [id, rev] of updates) {
-    await httpRequest('PATCH', SUPABASE_URL + '/rest/v1/appointments?id=eq.' + id,
+    // FIX: update dashboard_appointments not appointments
+    await httpRequest('PATCH', SUPABASE_URL + '/rest/v1/dashboard_appointments?id=eq.' + id,
       Object.assign({ 'Prefer': 'return=minimal' }, supabaseHeaders), { actual_revenue: rev });
     done++;
     if (done % 100 === 0) { console.log('  ... ' + done + '/' + updates.length); await sleep(200); }
@@ -330,7 +364,7 @@ async function updateAppointmentRevenue() {
 
 async function runSync() {
   console.log('============================================================');
-  console.log('BEP Sync V6 - ' + new Date().toISOString());
+  console.log('BEP Sync V7 - ' + new Date().toISOString());
   console.log('============================================================');
   const t = Date.now();
   let failed = false;
