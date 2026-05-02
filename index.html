@@ -1213,14 +1213,20 @@ async function buildGrowthTab() {
   // Fetch data for all periods in parallel (batch via worker)
   const periodData = await Promise.all(periods.map(async p => {
     try {
-      const [apptRes, patRes, invRes] = await Promise.all([
+      const [apptRes, patRes] = await Promise.all([
         apiGet('get_appointments_range', { from: p.from, to: p.to }),
         apiGet('get_new_patients', { from: p.from, to: p.to }),
-        apiGet('get_invoices_range', { from: p.from, to: p.to }),
       ]);
 
       const nowISO = new Date().toISOString();
       const appts = apptRes.appointments || [];
+
+      // Fetch invoices by appointment ID so revenue is tied to appointment date,
+      // not invoice created_at — this matches Cliniko's own revenue reports.
+      const apptIds = appts.map(a => a.id).join(',');
+      const invRes = apptIds
+        ? await apiGet('get_invoices_by_appointments', { ids: apptIds })
+        : { invoices: [] };
       const indiv = appts.filter(a => !isGroup(a) && a.starts_at <= nowISO);
       const classes = appts.filter(a => isGroup(a) && !isCancelled(a) && a.starts_at <= nowISO);
       const cancelled = indiv.filter(isCancelled);
