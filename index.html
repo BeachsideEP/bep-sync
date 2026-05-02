@@ -1230,9 +1230,8 @@ async function buildGrowthTab() {
       const attendRate = booked > 0 ? Math.round(attended.length / booked * 100) : 0;
       const cancelRate = (booked + cancelled.length) > 0 ? Math.round(cancelled.length / (booked + cancelled.length) * 100) : 0;
 
-      // Class attendees: group by session (starts_at slot), take max attendee_count per slot.
-      // The worker now populates attendee_count from the appointment_attendees table.
-      // Group rows: one row per session — attendee_count IS the headcount for that session.
+      // Class attendees: group by session slot, sum attendee_count.
+      // Worker fetches live counts from Cliniko's appointment_attendees endpoint.
       const sessionAttendees = {};
       classes.forEach(a => {
         const slot = a.starts_at ? a.starts_at.slice(0, 16) : String(a.id);
@@ -2080,51 +2079,26 @@ function buildTimeLost(appts, fromStr, toStr) {
 let chartClasses = null;
 
 function buildClasses(appts, invoices) {
-  // Group appointments: a "class" appointment has max_attendees > 1
   const classAppts = appts.filter(a => !isCancelled(a) && isGroup(a) && a.starts_at <= new Date().toISOString());
 
-  // Group by individual session (each class date is its own row)
-  const classMap = {}; // key: exact datetime
-
-  // Build a slot -> attendee count map from non-group individual appointments
-  // (Cliniko creates per-patient appointment rows when you "Add Client" to a class).
-  // These show up as non-group rows at the same starts_at with a real patient_id.
-  const slotAttendeeMap = {};
-  appts.forEach(a => {
-    if (!isGroup(a) && !isCancelled(a) && a._patId) {
-      const slot = a.starts_at ? a.starts_at.slice(0, 16) : '';
-      if (slot) {
-        if (!slotAttendeeMap[slot]) slotAttendeeMap[slot] = new Set();
-        slotAttendeeMap[slot].add(a._patId);
-      }
-    }
-  });
-
+  // One entry per unique session slot — attendee_count comes from the worker (live Cliniko fetch)
+  const classMap = {};
   classAppts.forEach(a => {
     const typeName = a.appointment_type_name || 'Unknown Class';
     const dt = new Date(a.starts_at);
     const dateStr = dt.toLocaleDateString('en-AU', { weekday: 'short', day: 'numeric', month: 'short' });
     const timeStr = dt.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', hour12: false });
     const sessionKey = a.starts_at.slice(0, 16);
-
     if (!classMap[sessionKey]) {
       classMap[sessionKey] = { name: typeName, date: dateStr, time: timeStr, starts_at: a.starts_at, attendees: 0, revenue: 0 };
     }
-
-    // Priority 1: attendee_count from worker (populated from appointment_attendees table)
-    if (a.attendee_count && a.attendee_count > 0) {
-      classMap[sessionKey].attendees = Math.max(classMap[sessionKey].attendees, a.attendee_count);
-    }
-    // Priority 2: count unique patient IDs from individual per-patient appointment rows at same slot
-    else {
-      const slotPatients = slotAttendeeMap[sessionKey];
-      if (slotPatients && slotPatients.size > 0) {
-        classMap[sessionKey].attendees = slotPatients.size;
-      }
+    // Use the highest attendee_count seen for this slot (worker fetches live from Cliniko)
+    if ((a.attendee_count || 0) > classMap[sessionKey].attendees) {
+      classMap[sessionKey].attendees = a.attendee_count;
     }
   });
 
-  // Match revenue from invoices — use appointment_id directly
+  // Match revenue from invoices
   const classApptIds = new Set(classAppts.map(a => String(a.id)));
   invoices.forEach(inv => {
     const apptId = String(inv.appointment_id || '');
@@ -2135,27 +2109,17 @@ function buildClasses(appts, invoices) {
     if (classMap[sessionKey]) classMap[sessionKey].revenue += parseFloat(inv.total_amount || 0);
   });
 
-  const classes = Object.values(classMap).sort((a,b) => b.starts_at.localeCompare(a.starts_at));
+  const classes = Object.values(classMap).sort((a, b) => b.starts_at.localeCompare(a.starts_at));
   const totalClasses = classes.length;
   const totalAttendees = classes.reduce((s, c) => s + c.attendees, 0);
   const totalRevenue = classes.reduce((s, c) => s + c.revenue, 0);
 
   document.getElementById('cls-total').textContent = totalClasses;
   document.getElementById('cls-attendees').textContent = totalAttendees;
-
-  // Show a sub-label if attendee counts are still all zero (sync not yet updated)
-  const attendeeSubEl = document.getElementById('cls-attendees-sub');
-  if (attendeeSubEl) {
-    if (totalClasses > 0 && totalAttendees === 0) {
-      attendeeSubEl.textContent = '⚠ Requires sync script update';
-      attendeeSubEl.style.color = 'var(--warning)';
-    } else {
-      attendeeSubEl.textContent = 'across all classes';
-      attendeeSubEl.style.color = '';
-    }
-  }
-
   document.getElementById('cls-revenue').textContent = '$' + totalRevenue.toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+  const sub = document.getElementById('cls-attendees-sub');
+  if (sub) { sub.textContent = 'across all classes'; sub.style.color = ''; }
 
   const tbody = document.getElementById('cls-table-body');
   if (!classes.length) {
@@ -2165,21 +2129,27 @@ function buildClasses(appts, invoices) {
       <td class="fw">${c.name}</td>
       <td style="font-size:12px;color:var(--muted2);">${c.date}</td>
       <td style="font-size:12px;color:var(--muted2);">${c.time}</td>
-      <td class="mono c-sky">${c.attendees > 0 ? c.attendees : '<span style="color:var(--muted)">—</span>'}</td>
+      <td class="mono c-sky">${c.attendees > 0 ? c.attendees : '—'}</td>
       <td class="mono c-success">${c.revenue > 0 ? '$' + c.revenue.toLocaleString('en-AU', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—'}</td>
     </tr>`).join('');
   }
 
-  // Timeslot popularity chart
-  const slotCounts = {};
-  classAppts.forEach(a => {
-    const dt = new Date(a.starts_at);
+  // Chart — average attendees per recurring day/time slot
+  // e.g. "Thu 17:00" might have run 4 times → show average across those sessions
+  const slotTotals = {};  // label -> total attendees
+  const slotOccur  = {};  // label -> number of sessions
+  classes.forEach(c => {
+    const dt = new Date(c.starts_at);
     const label = dt.toLocaleDateString('en-AU', { weekday: 'short' }) + ' ' + dt.toLocaleTimeString('en-AU', { hour: '2-digit', minute: '2-digit', hour12: false });
-    slotCounts[label] = (slotCounts[label] || 0) + 1;
+    slotTotals[label] = (slotTotals[label] || 0) + c.attendees;
+    slotOccur[label]  = (slotOccur[label]  || 0) + 1;
   });
-  const sortedSlots = Object.entries(slotCounts).sort((a, b) => b[1] - a[1]);
+  const slotAvg = Object.fromEntries(
+    Object.keys(slotTotals).map(k => [k, slotOccur[k] > 0 ? slotTotals[k] / slotOccur[k] : 0])
+  );
+  const sortedSlots = Object.entries(slotAvg).sort((a, b) => b[1] - a[1]);
   const slotLabels = sortedSlots.map(([k]) => k);
-  const slotData = sortedSlots.map(([, v]) => v);
+  const slotData   = sortedSlots.map(([, v]) => parseFloat(v.toFixed(1)));
 
   if (chartClasses) chartClasses.destroy();
   if (slotLabels.length) {
