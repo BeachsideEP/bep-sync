@@ -539,7 +539,7 @@
         <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:24px;">
           <div class="stat-card"><div class="stat-label">Total Sources</div><div class="stat-value c-sky" id="ref-total-sources">—</div><div class="stat-sub">unique referrers this period</div></div>
           <div class="stat-card"><div class="stat-label">Referred Patients</div><div class="stat-value c-success" id="ref-total-patients">—</div><div class="stat-sub">new patients this period</div></div>
-          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">this period</div></div>
+          <div class="stat-card"><div class="stat-label">Top Referrer</div><div class="stat-value" id="ref-top-name" style="font-size:18px;">—</div><div class="stat-sub" id="ref-top-count">all time</div></div>
           <div class="stat-card"><div class="stat-label">Est. Revenue</div><div class="stat-value c-success" id="ref-revenue">—</div><div class="stat-sub">from referred patients</div></div>
         </div>
 
@@ -1420,19 +1420,31 @@ function buildReferralHub(periodPatients, allTimePatients, appts, invoices) {
   _refAppts    = appts || [];
   _refInvoices = invoices || [];
 
-  // Period tiles — use period patients
+  // Period tiles — use period patients for counts
   const periodWithSource = (periodPatients || []).filter(p => p.referral_source);
   const periodSources = new Set(periodWithSource.map(p => normaliseReferralSource(p.referral_source)));
   const periodTop = {};
   periodWithSource.forEach(p => { const k = normaliseReferralSource(p.referral_source); periodTop[k] = (periodTop[k]||0)+1; });
-  const topPeriod = Object.entries(periodTop).sort((a,b)=>b[1]-a[1])[0];
+
+  // All-time sources for charts and top referrer name
+  const allSources = {};
+  (allTimePatients || []).forEach(p => {
+    const raw = p.referral_source || null;
+    if (!raw || !raw.trim()) return;
+    const key = normaliseReferralSource(raw);
+    allSources[key] = (allSources[key] || 0) + 1;
+  });
+  const allTimeSorted = Object.entries(allSources).sort((a,b) => b[1]-a[1]);
+  const topAllTime = allTimeSorted[0]; // top referrer by all-time volume
+
   const periodPatIds = new Set(periodWithSource.map(p => String(p.id)));
   const periodRevenue = _refInvoices.reduce((s,inv) => s + (periodPatIds.has(String(inv.patient_id)) ? parseFloat(inv.total_amount||0) : 0), 0);
 
   document.getElementById('ref-total-sources').textContent = periodSources.size;
   document.getElementById('ref-total-patients').textContent = periodWithSource.length;
-  document.getElementById('ref-top-name').textContent = topPeriod ? topPeriod[0] : '—';
-  document.getElementById('ref-top-count').textContent = topPeriod ? topPeriod[1] + ' patients this period' : '';
+  // Show all-time top referrer name, with their all-time count
+  document.getElementById('ref-top-name').textContent = topAllTime ? topAllTime[0] : '—';
+  document.getElementById('ref-top-count').textContent = topAllTime ? topAllTime[1] + ' patients all time' : '';
   document.getElementById('ref-revenue').textContent = '$' + periodRevenue.toLocaleString('en-AU',{minimumFractionDigits:2,maximumFractionDigits:2});
 
   // All-time sources for charts
