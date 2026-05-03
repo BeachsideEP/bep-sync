@@ -176,7 +176,7 @@ function mapAppointment(a, isCancelled, apptTypeLookup, forceGroup) {
     cancellation_note:     a.cancellation_note || a.cancellation_reason || null,
     treatment_note_status: Number(a.treatment_note_status) || 0,
     is_group:              isGroup,
-    attendee_count:        isGroup ? (Array.isArray(a.patient_ids) ? a.patient_ids.length : (a.max_attendees || 1)) : 1,
+    attendee_count:        isGroup ? (Array.isArray(a.patient_ids) ? a.patient_ids.length : (a.max_attendees || 0)) : 1,
     status_clean:          status,
     is_completed:          status === 'completed',
     is_dna:                status === 'dna',
@@ -210,7 +210,7 @@ async function syncPatients() {
   console.log('\n Syncing patients since ' + lastSync + '...');
   try {
     const items = await clinikoFetchAll(
-      'patients?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'patients');
+      'patients?per_page=' + PER_PAGE + '&q[]=' + encodeURIComponent('updated_at:>' + lastSync), 'patients');
     const rows = items.map(p => ({
       id: Number(p.id), first_name: p.first_name, last_name: p.last_name,
       dob: p.date_of_birth || null, referral_source: p.referral_source || null,
@@ -231,18 +231,18 @@ async function syncAppointments() {
     const apptTypeLookup = await fetchAppointmentTypes();
 
     const active = await clinikoFetchAll(
-      'individual_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
+      'individual_appointments?per_page=' + PER_PAGE + '&q[]=' + encodeURIComponent('updated_at:>' + lastSync),
       'individual_appointments');
     console.log('  Active: ' + active.length);
 
     const cancelled = await clinikoFetchAll(
-      'individual_appointments/cancelled?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
+      'individual_appointments/cancelled?per_page=' + PER_PAGE + '&q[]=' + encodeURIComponent('updated_at:>' + lastSync),
       'individual_appointments');
     console.log('  Cancelled: ' + cancelled.length);
 
     console.log('  Fetching group appointments (classes)...');
     const groupActive = await clinikoFetchAll(
-      'group_appointments?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync),
+      'group_appointments?per_page=' + PER_PAGE + '&q[]=' + encodeURIComponent('updated_at:>' + lastSync),
       'group_appointments');
     console.log('  Group active: ' + groupActive.length);
     if (groupActive.length > 0) {
@@ -273,7 +273,7 @@ async function syncInvoices() {
   console.log('\n Syncing invoices since ' + lastSync + '...');
   try {
     const items = await clinikoFetchAll(
-      'invoices?per_page=' + PER_PAGE + '&updated_since=' + encodeURIComponent(lastSync), 'invoices');
+      'invoices?per_page=' + PER_PAGE + '&q[]=' + encodeURIComponent('updated_at:>' + lastSync), 'invoices');
 
     const rows = items.map(inv => {
       const total = parseFloat(inv.total_amount) || parseFloat(inv.net_amount) || 0;
