@@ -278,7 +278,11 @@ async function syncInvoices() {
       'invoices?per_page=' + PER_PAGE + '&q[]=' + encodeURIComponent('updated_at:>' + lastSync), 'invoices');
 
     const rows = items.map(inv => {
-      const total = parseFloat(inv.total_amount) || parseFloat(inv.net_amount) || 0;
+      // Cliniko: net_amount = ex-GST, tax_amount = GST, total_amount = inc-GST
+      // Use net + tax to get true inc-GST total; fall back to total_amount if net is missing
+      const net  = parseFloat(inv.net_amount)  || 0;
+      const tax  = parseFloat(inv.tax_amount)  || 0;
+      const total = (net + tax) > 0 ? (net + tax) : (parseFloat(inv.total_amount) || 0);
       return {
         id:              Number(inv.id),
         patient_id:      extractId(inv.patient),
