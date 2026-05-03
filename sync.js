@@ -286,7 +286,7 @@ async function syncInvoices() {
         practitioner_id: extractId(inv.practitioner),
         total_amount:    total,
         status:          inv.status || null,
-        issue_date:      inv.issue_date || null,
+        issue_date:      inv.issue_date || inv.created_at?.slice(0, 10) || null,
         created_at:      inv.created_at,
         updated_at:      inv.updated_at,
       };
