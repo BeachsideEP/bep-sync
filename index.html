@@ -841,14 +841,9 @@ async function loadDashboard() {
       referral_source: p.referral_source || null,
     }));
 
-    // New patients for the selected period (for stat card)
-    const patientData = await apiGet('get_new_patients', { from: fromStr, to: toStr });
-    allNewPatients = (patientData.patients || []).map(p => ({
-      ...p,
-      id:              String(p.id),
-      full_name:       [p.first_name, p.last_name].filter(Boolean).join(' '),
-      referral_source: p.referral_source || null,
-    }));
+    // New patients for the selected period (for stat card and action generation)
+    // refData already fetched above for the same period — reuse it
+    allNewPatients = refPatients;
 
     // Invoices — practitioner_id is a direct column now, enrich with name
     showLoading('Fetching invoices...');
@@ -1073,7 +1068,8 @@ function buildRevenueChart(invoices, fromStr, toStr) {
   const end = new Date(toStr + 'T00:00:00');
   while (d <= end) { days[fmtDate(d)] = 0; d.setDate(d.getDate()+1); }
   invoices.forEach(inv => {
-    const day = inv.created_at?.slice(0,10);
+    // Use issue_date (the date printed on the invoice) not created_at (when the record was created)
+    const day = inv.issue_date ? inv.issue_date.slice(0,10) : inv.created_at?.slice(0,10);
     if (days[day] !== undefined) days[day] += parseFloat(inv.total_amount || inv.amount || 0);
   });
   const labels = Object.keys(days).map(d => new Date(d+'T00:00:00').toLocaleDateString('en-AU',{day:'numeric',month:'short'}));
@@ -1182,20 +1178,27 @@ async function buildGrowthTab() {
     }
   } else if (_growthPeriod === 'quarter') {
     for (let i = _growthWindow - 1; i >= 0; i--) {
-      const totalMonths = now.getMonth() - (i * 3);
-      const year = now.getFullYear() + Math.floor(totalMonths / 12);
-      const month = ((totalMonths % 12) + 12) % 12;
-      const qStart = new Date(year, month - (month % 3), 1);
-      const qEnd = new Date(qStart.getFullYear(), qStart.getMonth() + 3, 0);
-      const label = `Q${Math.floor(qStart.getMonth()/3)+1} ${qStart.getFullYear().toString().slice(2)}`;
+      // Total quarters since year 0, go back i quarters from current quarter
+      const currentQuarter = Math.floor(now.getMonth() / 3);
+      const totalQ = now.getFullYear() * 4 + currentQuarter - i;
+      const qYear = Math.floor(totalQ / 4);
+      const qNum = ((totalQ % 4) + 4) % 4; // normalise to 0-3
+      const qStart = new Date(qYear, qNum * 3, 1);
+      const qEnd = new Date(qYear, qNum * 3 + 3, 0);
+      const label = `Q${qNum + 1} ${qYear.toString().slice(2)}`;
       periods.push({ from: fmtDate(qStart), to: fmtDate(qEnd), label });
     }
   } else {
     for (let i = _growthWindow - 1; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - (i * 7));
-      const weekStart = new Date(d);
-      weekStart.setDate(d.getDate() - d.getDay() + 1);
+      // Start from the Monday of the current week, then go back i weeks
+      const todayDay = now.getDay(); // 0 = Sunday
+      const mondayOffset = todayDay === 0 ? -6 : 1 - todayDay;
+      const currentMonday = new Date(now);
+      currentMonday.setDate(now.getDate() + mondayOffset);
+      currentMonday.setHours(0, 0, 0, 0);
+      // Go back i weeks from current Monday
+      const weekStart = new Date(currentMonday);
+      weekStart.setDate(currentMonday.getDate() - (i * 7));
       const weekEnd = new Date(weekStart);
       weekEnd.setDate(weekStart.getDate() + 6);
       const label = weekStart.toLocaleDateString('en-AU', { day: 'numeric', month: 'short' });
@@ -1826,13 +1829,13 @@ function addAction(priority) {
 }
 
 function toggleAction(id, done) {
-  const actions = getActions().map(a => a.id === id ? {...a, done, doneAt: done ? new Date().toLocaleDateString('en-AU') : null } : a);
+  const actions = getActions().map(a => String(a.id) === String(id) ? {...a, done, doneAt: done ? new Date().toLocaleDateString('en-AU') : null } : a);
   saveActions(actions);
   renderActions();
 }
 
 function deleteAction(id) {
-  saveActions(getActions().filter(a => a.id !== id));
+  saveActions(getActions().filter(a => String(a.id) !== String(id)));
   renderActions();
 }
 
@@ -1847,12 +1850,12 @@ function renderActions() {
 
   function actionHtml(a) {
     return `<div style="display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--border);">
-      <input type="checkbox" ${a.done?'checked':''} onchange="toggleAction(${a.id},this.checked)" style="width:16px;height:16px;accent-color:var(--sky);cursor:pointer;flex-shrink:0;">
+      <input type="checkbox" ${a.done?'checked':''} onchange="toggleAction('${a.id}',this.checked)" style="width:16px;height:16px;accent-color:var(--sky);cursor:pointer;flex-shrink:0;">
       <div style="flex:1;">
         <div style="font-size:13px;color:var(--text);${a.done?'text-decoration:line-through;color:var(--muted);':''}">${a.text}</div>
         <div style="font-size:11px;color:var(--muted);margin-top:2px;">${a.tag}${a.doneAt?' · Done '+a.doneAt:''}</div>
       </div>
-      <button onclick="deleteAction(${a.id})" style="background:none;border:none;color:var(--muted);cursor:pointer;padding:4px;font-size:16px;line-height:1;" title="Delete">✕</button>
+      <button onclick="deleteAction('${a.id}')" style="background:none;border:none;color:var(--muted);cursor:pointer;padding:4px;font-size:16px;line-height:1;" title="Delete">✕</button>
     </div>`;
   }
 
@@ -2316,7 +2319,7 @@ function renderTeam() {
       ${m.goals ? `<div style="font-size:12px;margin-bottom:8px;"><span style="color:var(--muted);">Goals: </span>${m.goals}</div>` : ''}
       ${m.working ? `<div style="font-size:12px;margin-bottom:8px;"><span style="color:var(--muted);">Working on: </span>${m.working}</div>` : ''}
       ${(() => {
-        const leaves = (m.leave || []).filter(l => new Date(l.to) >= now).sort((a,b) => a.from.localeCompare(b.from));
+        const leaves = (m.leave || []).filter(l => new Date(l.to + 'T23:59:59') >= now).sort((a,b) => a.from.localeCompare(b.from));
         if (!leaves.length) return '';
         return `<div style="margin-top:10px;padding:10px;background:rgba(251,191,36,0.06);border:1px solid rgba(251,191,36,0.2);border-radius:8px;">
           <div style="font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--warning);margin-bottom:6px;">Upcoming Leave</div>
