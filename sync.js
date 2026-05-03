@@ -105,7 +105,9 @@ async function supabaseUpsert(table, rows, batchSize) {
 
 async function getLastSync(entity) {
   const data = await httpGet(SUPABASE_URL + '/rest/v1/sync_state?entity=eq.' + entity + '&select=last_synced_at', supabaseHeaders);
-  return (data[0] && data[0].last_synced_at) ? data[0].last_synced_at : '2000-01-01T00:00:00Z';
+  // Cliniko requires UTC timestamps ending in Z — normalise any +00:00 offset stored by Supabase
+  const raw = data[0] && data[0].last_synced_at ? data[0].last_synced_at : '2000-01-01T00:00:00Z';
+  return new Date(raw).toISOString();
 }
 
 async function updateLastSync(entity) {
